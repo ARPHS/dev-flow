@@ -2,7 +2,7 @@
 
 ## 何时创建
 
-只有 `feature`、`project`、需要跨会话恢复或用户明确要求时，在目标项目创建 `.dev-flow/`：
+`feature` 和 `project` 在取基线之前必须在目标项目创建 `.dev-flow/`（证据工具只在该目录存在时记录）；`quick` 不创建，除非用户明确要求：
 
 ```text
 .dev-flow/

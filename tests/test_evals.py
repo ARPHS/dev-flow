@@ -7,12 +7,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EVALS = ROOT / "evals"
 sys.path.insert(0, str(EVALS))
+import lib  # noqa: E402
 from lib import FIXTURES, Context  # noqa: E402
 
 
@@ -168,6 +170,47 @@ class EvalCasesTest(unittest.TestCase):
         test_index = ctx.first_index(lambda n, d: n == "Bash" and "unittest" in d["command"])
         edit_index = ctx.first_index(lambda n, d: n == "Edit")
         self.assertLess(test_index, edit_index)
+
+    def test_evidence_calls_through_alias(self):
+        def bash(command):
+            return json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": command}}]}})
+        transcript = "\n".join([
+            bash('EV="python /p/df-verify/scripts/evidence.py" && $EV run -l test -- python -m unittest'),
+            bash("python /p/df-verify/scripts/evidence.py report"),
+            bash("$EV run -l x -- true"),  # alias alone does not prove the evidence CLI ran
+        ])
+        ctx = Context(ws=Path(self.tmp.name), fixture=FIXTURES / "ledger", base="", transcripts=[transcript])
+        runs, reports = lib.evidence_recorded(ctx)
+        self.assertEqual((runs.ok, runs.detail, reports.ok, reports.detail), (True, "1 次", True, "1 次"))
+
+
+class RunTurnTests(unittest.TestCase):
+    """The runner must not hang on CLIs whose children outlive the turn."""
+
+    # parent prints a finished turn, leaves a grandchild holding stdout, then lingers
+    LINGER = ("import subprocess, sys, time; "
+              f"print(sys.stdin.read().strip()); print({json.dumps({'type': 'turn.completed'})!r}, flush=True); "
+              "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); time.sleep(60)")
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("eval_run", EVALS / "run.py")
+        self.run_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.run_module)
+
+    def test_killed_after_turn_completed(self):
+        start = time.time()
+        out, err = self.run_module.run_turn([sys.executable, "-c", self.LINGER], ".", "hi", timeout=50, grace=1)
+        self.assertLess(time.time() - start, 30)
+        self.assertIn("turn.completed", out)
+        self.assertTrue(out.startswith("hi"))
+        self.assertIn("killed", err)
+
+    def test_timeout_kills_tree(self):
+        start = time.time()
+        _, err = self.run_module.run_turn([sys.executable, "-c", "import time; time.sleep(60)"], ".", "", timeout=2)
+        self.assertLess(time.time() - start, 30)
+        self.assertIn("timeout after 2s", err)
 
 
 if __name__ == "__main__":

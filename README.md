@@ -70,7 +70,7 @@ flowchart LR
 
 ## 状态目录
 
-长任务在目标项目创建 `.dev-flow/`（`project.md`、`task.md`、`progress.md`、`decisions.md`，以及证据工具使用的 `evidence.jsonl` 和 `objects/`），用于跨会话恢复。目录内自带一个内容为 `*` 的 `.gitignore`，不会出现在 `git status` 中，也不会修改项目的 `.gitignore` 或 `.git/`。
+`feature` 和 `project` 任务在目标项目创建 `.dev-flow/`（`project.md`、`task.md`、`progress.md`、`decisions.md`，以及证据工具使用的 `evidence.jsonl` 和 `objects/`），用于证据记录和跨会话恢复。目录内自带一个内容为 `*` 的 `.gitignore`，不会出现在 `git status` 中，也不会修改项目的 `.gitignore` 或 `.git/`。
 
 ## 证据 CLI
 

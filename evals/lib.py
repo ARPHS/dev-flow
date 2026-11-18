@@ -126,7 +126,7 @@ class Context:
         committed = self.git("diff", "--name-only", self.base).stdout.split()
         status = self.git("status", "--porcelain", "--untracked-files=all").stdout.splitlines()
         current = [line[3:].strip().strip('"') for line in status if line.strip()]
-        return sorted(set(committed) | set(current))
+        return sorted(f for f in set(committed) | set(current) if "__pycache__/" not in f)  # interpreter byproducts
 
     def new_commits(self):
         out = self.git("rev-list", f"{self.base}..HEAD").stdout.split()
@@ -190,7 +190,11 @@ def baseline_before_edit(ctx, required=False):
 
 
 def evidence_recorded(ctx, turn=None):
-    runs, reports = ctx.ran(r"evidence\.py\S*\s+run\b", turn), ctx.ran(r"evidence\.py\S*\s+report\b", turn)
+    # models often alias the CLI first: EV="python .../evidence.py"; $EV run ...
+    def calls(sub):
+        return [c for c in ctx.ran(r"evidence\.py", turn)
+                if re.search(rf"(?:evidence\.py\S*|\$\{{?\w+\}}?)\s+{sub}\b", c)]
+    runs, reports = calls("run"), calls("report")
     return [Check("用 evidence.py run 记录验证", bool(runs), f"{len(runs)} 次", required=False),
             Check("用 evidence.py report 生成证据表", bool(reports), f"{len(reports)} 次", required=False)]
 

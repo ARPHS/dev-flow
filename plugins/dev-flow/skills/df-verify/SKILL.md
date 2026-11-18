@@ -1,6 +1,6 @@
 ---
 name: df-verify
-description: 在声明开发任务完成前选择并运行适用的测试、静态检查、构建和真实入口验证，输出可复核证据（verify, run tests, check before done）。
+description: 在声明开发任务完成之前调用：选择并运行适用的测试、静态检查、构建和真实入口验证，用配套的 evidence.py 记录可复核证据（verify, run tests, check before done）。
 ---
 
 # Verify
@@ -26,7 +26,7 @@ $EV run -l lint -- npm run lint
 
 需要管道、`&&`、设置环境变量等 shell 特性时，显式包一层：`-- bash -c "LEDGER_FILE=/tmp/l.json python -m ledger list"`，或 `-- pwsh -NoProfile -Command "..."`。不要把整条命令放进一对引号里传给 `run`，它会报错提示。Windows PowerShell 5.1 会丢掉传给外部程序的参数里嵌套的双引号，包装命令内部改用单引号，或改用 `pwsh`（7.x）。
 
-快照对象只写入 `.dev-flow/objects`，不写进项目的 `.git`，也不改动暂存区。只有存在 `.dev-flow/` 时才会记录；没有时直接运行命令即可，不必为此创建 `.dev-flow/`。
+快照对象只写入 `.dev-flow/objects`，不写进项目的 `.git`，也不改动暂存区。只有存在 `.dev-flow/` 时才会记录：`feature`、`project` 任务必须已有该目录（由 `df-flow` 创建，缺失时先创建，并写入内容为 `*` 的 `.dev-flow/.gitignore`）；`quick` 或单独验证且没有该目录时，直接运行命令即可。
 
 ## 步骤
 

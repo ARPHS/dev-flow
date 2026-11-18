@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -85,11 +86,16 @@ def find_exe(name):
 CODEX_PLUGIN = "dev-flow@dev-flow"
 
 
-def install_codex_plugin():
-    """Refresh Codex's cached copy of the plugin from this working tree."""
+def install_codex_plugin(enabled=True):
+    """Refresh Codex's cached copy of the plugin from this working tree, or uninstall it for a baseline.
+
+    A `-c plugins."dev-flow@dev-flow".enabled=false` override is not honoured, so baselines uninstall.
+    """
     exe = find_exe("codex")
     quiet = {"capture_output": True, "text": True, "encoding": "utf-8"}
     subprocess.run([exe, "plugin", "remove", CODEX_PLUGIN], **quiet)
+    if not enabled:
+        return
     subprocess.run([exe, "plugin", "marketplace", "add", str(EVALS.parent)], **quiet)
     proc = subprocess.run([exe, "plugin", "add", CODEX_PLUGIN], **quiet)
     if proc.returncode != 0:
@@ -101,8 +107,6 @@ def codex_command(args, thread):
     if thread:
         cmd += ["resume", thread]
     cmd += ["--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"']
-    if args.no_plugin:
-        cmd += ["-c", f'plugins."{CODEX_PLUGIN}".enabled=false']
     if args.model:
         cmd += ["-m", args.model]
     return cmd + ["-"]
@@ -157,6 +161,64 @@ def agent_command(args, turn):
     return cmd
 
 
+TURN_DONE = ('"type":"turn.completed"', '"type":"result"')  # codex / claude end-of-turn events
+GRACE = 30  # seconds a CLI may linger after its turn ended (e.g. a background subagent)
+
+
+def kill_tree(proc):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        import signal
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def run_turn(command, cwd, prompt, timeout, grace=GRACE):
+    """Run one agent turn; return (stdout, stderr-or-note).
+
+    The process tree is killed on timeout, or shortly after the end-of-turn event if the
+    CLI keeps running: a plain subprocess timeout only kills the direct child and then
+    blocks on pipes still held by grandchildren.
+    """
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+             else {"start_new_session": True})
+    proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", **group)
+    out, err, done = [], [], threading.Event()
+
+    def read_out():
+        for line in proc.stdout:
+            out.append(line)
+            if any(marker in line.replace(" ", "") for marker in TURN_DONE):
+                done.set()
+
+    readers = [threading.Thread(target=read_out, daemon=True),
+               threading.Thread(target=lambda: err.extend(proc.stderr), daemon=True)]
+    for reader in readers:
+        reader.start()
+    proc.stdin.write(prompt)
+    proc.stdin.close()
+
+    deadline, note = time.time() + timeout, ""
+    while proc.poll() is None:
+        if time.time() > deadline:
+            note = f"timeout after {timeout}s"
+        elif done.wait(1) and proc.poll() is None:
+            try:
+                proc.wait(grace)
+            except subprocess.TimeoutExpired:
+                note = f"still running {grace}s after the turn ended; killed"
+        if note:
+            kill_tree(proc)
+            break
+    for reader in readers:
+        reader.join(10)
+    for pipe in (proc.stdout, proc.stderr):
+        pipe.close()
+    proc.wait(10)
+    return "".join(out), "\n".join(filter(None, ["".join(err).strip(), note]))
+
+
 def run_case(name, case, out, args):
     case_dir = out / name
     ws = case_dir / "workspace"
@@ -174,12 +236,9 @@ def run_case(name, case, out, args):
         else:
             command = agent_command(args, index)
         try:
-            proc = subprocess.run(command, cwd=ws, input=prompt, capture_output=True,
-                                  text=True, encoding="utf-8", timeout=args.timeout)
-            text, err = proc.stdout, proc.stderr
-        except subprocess.TimeoutExpired as exc:
-            text = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            err = f"timeout after {args.timeout}s"
+            text, err = run_turn(command, ws, prompt, args.timeout)
+        except OSError as exc:
+            text, err = "", f"failed to start: {exc}"
         stats["seconds"] += time.time() - start
         thread = thread or (thread_id(text) if args.agent == "codex" else None)
         if thread:
@@ -265,8 +324,8 @@ def main():
         summarize([grade_case(d) for d in dirs], args.grade_only)
         return
 
-    if args.agent == "codex" and not args.no_plugin:
-        install_codex_plugin()
+    if args.agent == "codex":
+        install_codex_plugin(enabled=not args.no_plugin)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{args.agent}" + ("-noplugin" if args.no_plugin else "")
     out = args.out or Path(tempfile.gettempdir()) / "dev-flow-evals" / stamp
     out.mkdir(parents=True, exist_ok=True)

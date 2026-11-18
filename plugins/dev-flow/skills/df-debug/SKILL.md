@@ -1,6 +1,6 @@
 ---
 name: df-debug
-description: 在根因不明确、存在回归、性能下降或重复修复失败时建立可重复反馈循环并修复问题（debug, root cause, regression, flaky, slow）。普通小改动不要使用。
+description: 在修改代码修复缺陷之前先调用：用户报告问题“偶尔/有时”出现、结果不对但测试通过、出现回归、性能变慢或修过仍复发时，先用本技能复现并定位根因，再修复（debug, root cause, regression, flaky, slow）。原因已经明确的拼写、配置类小问题不要使用。
 ---
 
 # Debug

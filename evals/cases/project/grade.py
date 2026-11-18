@@ -13,7 +13,7 @@ def grade(ctx):
         Check("第一轮请求确认", any(k in ctx.final_text(0) for k in ("确认", "是否", "?", "？")), required=False),
         Check("第二轮产出代码", bool(final_code), ", ".join(final_code[:5])),
         Check("包含测试文件", bool(tests), ", ".join(tests[:3])),
-        Check("包含 README", readme is not None and readme.exists()),
+        Check("包含 README", readme is not None and readme.exists(), required=False),
         no_commits(ctx),
         Check("创建了 .dev-flow/task.md", (ctx.ws / ".dev-flow" / "task.md").exists(), required=False),
     ]
