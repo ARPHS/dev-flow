@@ -2,7 +2,7 @@
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "dev-flow",
   "displayName": "Dev Flow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "按任务风险推进软件开发、验证和收尾的轻量工作流",
   "author": {
     "name": "dev-flow contributors"

@@ -1,0 +1,8 @@
+{
+  "description": "只读问答：不应触发 df-flow，不应修改任何文件",
+  "fixture": "ledger",
+  "turns": [
+    "解释一下 ledger/store.py 里记录是怎样保存和重新读取的，有没有并发写入风险？"
+  ],
+  "rubric": "回答准确指出 JSON 整体读写和并发覆盖风险；没有修改代码。"
+}

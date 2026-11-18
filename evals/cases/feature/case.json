@@ -1,0 +1,8 @@
+{
+  "description": "feature：给已有 CLI 增加 --json 输出",
+  "fixture": "ledger",
+  "turns": [
+    "给 ledger 的 list 命令增加 --json 选项，输出所有记录组成的 JSON 数组，每条包含 amount 和 note 字段，方便其他脚本读取。"
+  ],
+  "rubric": "先跑基线；先写失败测试再实现；运行测试和真实 CLI 调用；最终报告给出命令和退出码；没有提交。"
+}

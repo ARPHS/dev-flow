@@ -1,0 +1,41 @@
+# 行为评测
+
+`tests/` 只检查结构和脚本；这里检查**插件实际改变了 agent 的什么行为**。每个用例把夹具复制到全新的 Git 仓库，用 `claude -p` 执行，再用程序化检查评分。
+
+## 用例
+
+| 用例 | 夹具 | 关注点 |
+|---|---|---|
+| `quick` | ledger | 小改动不进入完整流程、不建台账、不改无关文件 |
+| `explain` | ledger | 只读问答不触发 `df-flow`、不改文件 |
+| `feature` | ledger | 基线、测试先行、真实 CLI 调用、证据、不提交 |
+| `debug` | orders | 修复根因（隐藏用例覆盖多种数量和页大小），不放宽断言 |
+| `project` | empty | 第一轮出设计并停顿，第二轮确认后再实现 |
+
+检查分为**必需**（决定通过与否）和**参考**（例如是否调用了某个技能、是否创建 `.flow/`），参考项用于观察趋势。
+
+## 运行
+
+```powershell
+python -X utf8 evals/run.py                      # 全部用例，加载插件
+python -X utf8 evals/run.py --case feature debug # 指定用例
+python -X utf8 evals/run.py --no-plugin          # 不加载插件，作为对照组
+python -X utf8 evals/run.py --grade-only <结果目录>  # 修改评分器后重新评分
+```
+
+结果默认写入系统临时目录下的 `dev-flow-evals/<时间>/`，其中包含每个用例的工作区、每轮的 `turnN.jsonl` 原始记录、`result.json` 和汇总 `summary.md`。
+
+> [!WARNING]
+> agent 以 `--dangerously-skip-permissions` 在临时工作区中运行，并会产生模型调用费用。
+
+## 如何使用结果
+
+- 修改技能前后各跑一次，对比通过率和参考项。模型输出有随机性，关键结论至少重复 3 次。
+- 和 `--no-plugin` 对照组比较，确认插件确实带来了提升，而不只是增加了上下文。
+- `case.json` 中的 `rubric` 供人工或 LLM 复核那些难以程序化判断的部分（例如设计质量）。
+
+## 新增用例
+
+1. 在 `fixtures/` 下添加最小夹具（尽量只依赖标准库）。
+2. 在 `cases/<名称>/` 下添加 `case.json`（`description`、`fixture`、`turns`、`rubric`）和 `grade.py`（`grade(ctx) -> list[Check]`，可用的辅助函数见 `lib.py`）。
+3. 在 `tests/test_evals.py` 中加入"未修改的夹具应失败、参考答案应通过"的测试，确保评分器能区分好坏结果。
