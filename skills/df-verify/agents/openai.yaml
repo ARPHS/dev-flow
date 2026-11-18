@@ -1,0 +1,7 @@
+interface:
+  display_name: "df-verify"
+  short_description: "运行适用检查并记录完成证据"
+  default_prompt: "使用 $df-verify 验证当前改动，并整理命令、退出码和关键结果。"
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "df-debug"
+  short_description: "用最小复现定位并修复根因"
+  default_prompt: "使用 $df-debug 建立最小复现，定位根因并加入回归验证。"
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "df-flow"
+  short_description: "按风险推进开发并用证据收尾"
+  default_prompt: "使用 $df-flow 完成一项新功能或复杂工程任务，并在结束前提供可复核的验证证据。"
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "df-review"
+  short_description: "按需求和工程风险审查改动"
+  default_prompt: "使用 $df-review 审查当前改动并给出分级、可复核的问题报告。"
+
+policy:
+  allow_implicit_invocation: false

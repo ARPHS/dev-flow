@@ -1,0 +1,7 @@
+interface:
+  display_name: "df-plan"
+  short_description: "澄清需求并形成可执行计划"
+  default_prompt: "使用 $df-plan 为这项开发任务形成可验证的方案和执行计划。"
+
+policy:
+  allow_implicit_invocation: false

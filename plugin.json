@@ -1,0 +1,16 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dev-flow",
+  "version": "0.1.0",
+  "description": "按任务风险推进软件开发、验证和收尾的轻量工作流",
+  "author": {
+    "name": "dev-flow contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "software-engineering",
+    "coding-agent",
+    "verification",
+    "debugging"
+  ]
+}
