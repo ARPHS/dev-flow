@@ -14,17 +14,15 @@ claude --plugin-dir .\dev-flow
 
 ### Claude Code 从 GitHub marketplace 安装
 
-将 `OWNER/dev-flow` 替换为实际仓库地址：
-
 ```powershell
-claude plugin marketplace add OWNER/dev-flow
+claude plugin marketplace add ARPHS/dev-flow
 claude plugin install dev-flow@dev-flow
 ```
 
 ### Codex CLI
 
 ```powershell
-codex plugin marketplace add OWNER/dev-flow
+codex plugin marketplace add ARPHS/dev-flow
 codex plugin add dev-flow@dev-flow
 ```
 
