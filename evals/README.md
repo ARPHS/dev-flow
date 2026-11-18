@@ -1,6 +1,6 @@
 # 行为评测
 
-`tests/` 只检查结构和脚本；这里检查**插件实际改变了 agent 的什么行为**。每个用例把夹具复制到全新的 Git 仓库，用 `claude -p` 执行，再用程序化检查评分。
+`tests/` 只检查结构和脚本；这里检查**插件实际改变了 agent 的什么行为**。每个用例把夹具复制到全新的 Git 仓库，用 `claude -p` 或 `codex exec` 执行，再用程序化检查评分。两种 agent 的记录在 `lib.Context` 中统一成同一套工具调用，评分器不区分 agent。
 
 ## 用例
 
@@ -12,7 +12,7 @@
 | `debug` | orders | 修复根因（隐藏用例覆盖多种数量和页大小），不放宽断言 |
 | `project` | empty | 第一轮出设计并停顿，第二轮确认后再实现 |
 
-检查分为**必需**（决定通过与否）和**参考**（例如是否调用了某个技能、是否创建 `.dev-flow/`），参考项用于观察趋势。
+检查分为**必需**（决定通过与否）和**参考**（例如是否调用了某个技能、是否创建 `.dev-flow/`、是否用 `evidence.py` 记录验证、是否派发独立审查），参考项用于观察趋势。
 
 ## 运行
 
@@ -21,12 +21,20 @@ python -X utf8 evals/run.py                      # 全部用例，加载插件
 python -X utf8 evals/run.py --case feature debug # 指定用例
 python -X utf8 evals/run.py --no-plugin          # 不加载插件，作为对照组
 python -X utf8 evals/run.py --grade-only <结果目录>  # 修改评分器后重新评分
+python -X utf8 evals/run.py --model sonnet          # 指定 Claude 模型
+python -X utf8 evals/run.py --agent codex           # 用 Codex CLI 运行
 ```
+
+### Codex
+
+- 把 `CODEX_HOME` 指向一个专用于评测的目录，其中 `config.toml` 只保留模型、认证和 `[windows] sandbox` 等设置，不要带 MCP 服务器、notify 或 `sandbox_mode = "danger-full-access"`。
+- 运行器会先从当前工作树重新安装插件（Codex 从缓存加载插件，不重装就会测到旧版本）；`--no-plugin` 通过 `-c` 关闭插件。
+- agent 在默认的 `workspace-write` 沙箱中运行，后续轮次通过线程 id 续接。Codex 没有 Skill 工具，"调用技能"按读取 `df-*/SKILL.md` 的命令判断；成本列为 0，用 tokens 列代替。
 
 结果默认写入系统临时目录下的 `dev-flow-evals/<时间>/`，其中包含每个用例的工作区、每轮的 `turnN.jsonl` 原始记录、`result.json` 和汇总 `summary.md`。
 
 > [!WARNING]
-> agent 以 `--dangerously-skip-permissions` 在临时工作区中运行，并会产生模型调用费用。
+> Claude 以 `--dangerously-skip-permissions` 在临时工作区中运行；两种 agent 都会产生模型调用费用。
 
 ## 如何使用结果
 

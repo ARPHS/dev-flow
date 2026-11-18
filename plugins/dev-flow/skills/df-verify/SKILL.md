@@ -24,7 +24,7 @@ $EV run -l AC1 -- python -m pytest tests/cli -q
 $EV run -l lint -- npm run lint
 ```
 
-需要管道、`&&`、设置环境变量等 shell 特性时，显式包一层：`-- bash -c "LEDGER_FILE=/tmp/l.json python -m ledger list"`，或 `-- pwsh -NoProfile -Command "..."`。不要把整条命令放进一对引号里传给 `run`，它会报错提示。
+需要管道、`&&`、设置环境变量等 shell 特性时，显式包一层：`-- bash -c "LEDGER_FILE=/tmp/l.json python -m ledger list"`，或 `-- pwsh -NoProfile -Command "..."`。不要把整条命令放进一对引号里传给 `run`，它会报错提示。Windows PowerShell 5.1 会丢掉传给外部程序的参数里嵌套的双引号，包装命令内部改用单引号，或改用 `pwsh`（7.x）。
 
 快照对象只写入 `.dev-flow/objects`，不写进项目的 `.git`，也不改动暂存区。只有存在 `.dev-flow/` 时才会记录；没有时直接运行命令即可，不必为此创建 `.dev-flow/`。
 

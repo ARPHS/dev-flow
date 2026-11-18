@@ -51,4 +51,4 @@
 
 - `agents/` 只在 Claude Code 中注册为子代理。Codex 中由主控用 `spawn_agent`（`fork_turns: "none"`）按同一份角色正文派发，审查独立，但工具限制只靠文字约束，由主控事后用 `git status` 核对。
 - Codex 默认沙箱只允许写工作区，不允许写 `.git/`：因此 `.dev-flow/` 用自带的 `.gitignore` 而不是 `.git/info/exclude` 来忽略，`evidence.py` 的所有写入都在 `.dev-flow/` 内；并行 worktree 和提交需要用户批准提权。
-- 评测运行器目前只支持 Claude Code CLI。
+- 评测运行器支持 Claude Code 和 Codex CLI。Codex 没有 Skill 工具，评测只能根据"读取 SKILL.md 的命令"推断是否用了技能，比 Claude 的记录粗糙。

@@ -1,4 +1,4 @@
-from lib import Check, code_files, no_commits, ran_tests
+from lib import Check, code_files, evidence_recorded, independent_review, no_commits, ran_tests
 
 
 def grade(ctx):
@@ -18,5 +18,5 @@ def grade(ctx):
         Check("创建了 .dev-flow/task.md", (ctx.ws / ".dev-flow" / "task.md").exists(), required=False),
     ]
     if len(ctx.transcripts) > 1:
-        checks.append(ran_tests(ctx, turn=1))
+        checks += [ran_tests(ctx, turn=1), *evidence_recorded(ctx, turn=1), independent_review(ctx, turn=1)]
     return checks

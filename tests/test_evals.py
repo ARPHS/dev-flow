@@ -145,6 +145,30 @@ class EvalCasesTest(unittest.TestCase):
         checks = load_grader("project")(ctx)
         self.assertIn("第一轮停顿：未写实现代码", required_failures(checks))
 
+    def test_codex_transcript_translated(self):
+        def item(**data):
+            return json.dumps({"type": "item.completed", "item": data}, ensure_ascii=False)
+        pwsh = '"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe" -Command '
+        transcript = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "t1"}),
+            item(type="agent_message", text="先看技能"),
+            item(type="command_execution", exit_code=0,
+                 command=pwsh + "\"Get-Content -Raw 'C:/x/plugins/cache/dev-flow/dev-flow/0.3.0/skills/df-flow/SKILL.md'\""),
+            item(type="command_execution", command=pwsh + "'python -m unittest discover -s tests'", exit_code=0),
+            item(type="file_change", changes=[{"path": "C:/ws/ledger/cli.py", "kind": "update"}]),
+            item(type="collab_tool_call", tool="spawn_agent", arguments={"message": "df-reviewer 审查"}),
+            item(type="agent_message", text="完成，退出码 0"),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        ])
+        ctx = Context(ws=Path(self.tmp.name), fixture=FIXTURES / "ledger", base="", transcripts=[transcript])
+        self.assertEqual(ctx.skills_invoked(), ["dev-flow:df-flow"])
+        self.assertTrue(ctx.ran(r"unittest"))
+        self.assertEqual(ctx.final_text(), "完成，退出码 0")
+        self.assertIn("df-reviewer", ctx.subagents()[0])
+        test_index = ctx.first_index(lambda n, d: n == "Bash" and "unittest" in d["command"])
+        edit_index = ctx.first_index(lambda n, d: n == "Edit")
+        self.assertLess(test_index, edit_index)
+
 
 if __name__ == "__main__":
     unittest.main()

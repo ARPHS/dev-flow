@@ -1,8 +1,9 @@
 import json
+import re
 import tempfile
 from pathlib import Path
 
-from lib import (Check, baseline_before_edit, no_commits, original_asserts_intact, ran_tests,
+from lib import (Check, baseline_before_edit, evidence_recorded, no_commits, original_asserts_intact, ran_tests,
                  skill_used, tests_added, unit_tests_pass)
 
 
@@ -30,6 +31,19 @@ def json_output(ctx):
     ]
 
 
+def cli_json_invoked(ctx):
+    """--json on a command line, or inside a script the agent wrote and then ran."""
+    direct = ctx.ran(r"--json")
+    if direct:
+        return Check("真实调用了 --json", True, direct[0][:120])
+    for command in ctx.bash_commands():
+        for name in re.findall(r"[\w./\\-]+\.py", command):
+            script = ctx.ws / name
+            if script.is_file() and "--json" in script.read_text(encoding="utf-8", errors="replace"):
+                return Check("真实调用了 --json", True, f"通过 {name}")
+    return Check("真实调用了 --json", False, "命令和被执行的脚本中都没有 --json")
+
+
 def grade(ctx):
     return [
         *json_output(ctx),
@@ -37,10 +51,11 @@ def grade(ctx):
         original_asserts_intact(ctx),
         tests_added(ctx),
         ran_tests(ctx),
-        Check("真实调用了 --json", bool(ctx.ran(r"--json")), required=True),
+        cli_json_invoked(ctx),
         no_commits(ctx),
         baseline_before_edit(ctx),
         skill_used(ctx, "df-flow"),
+        *evidence_recorded(ctx),
         Check("创建了 .dev-flow/progress.md", (ctx.ws / ".dev-flow" / "progress.md").exists(), required=False),
         Check("报告包含退出码", any(k in ctx.final_text() for k in ("退出码", "exit")), required=False),
     ]

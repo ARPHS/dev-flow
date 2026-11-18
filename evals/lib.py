@@ -29,6 +29,25 @@ class Check:
         return asdict(self)
 
 
+SKILL_READ = re.compile(r"(df-[a-z]+)[/\\]+SKILL\.md")
+
+
+def codex_tool_uses(item):
+    """Translate one completed Codex item. Codex has no Skill tool: the model reads SKILL.md itself."""
+    kind = item.get("type")
+    if kind == "command_execution":
+        command = item.get("command") or ""
+        for skill in dict.fromkeys(SKILL_READ.findall(command)):
+            yield "Skill", {"skill": f"dev-flow:{skill}"}
+        yield "Bash", {"command": command, "exit_code": item.get("exit_code")}
+    elif kind == "file_change":
+        for change in item.get("changes") or []:
+            yield "Edit", {"file_path": change.get("path", ""), "kind": change.get("kind")}
+    elif item.get("tool"):  # mcp / collaboration tools such as spawn_agent
+        data = item.get("arguments")
+        yield item["tool"], data if isinstance(data, dict) else {k: v for k, v in item.items() if k != "result"}
+
+
 @dataclass
 class Context:
     ws: Path
@@ -50,12 +69,14 @@ class Context:
                         continue
 
     def tool_uses(self, turn=None):
+        """(name, input) pairs in Claude Code's vocabulary; Codex events are translated."""
         for event in self.events(turn):
-            if event.get("type") != "assistant":
-                continue
-            for item in event.get("message", {}).get("content", []) or []:
-                if isinstance(item, dict) and item.get("type") == "tool_use":
-                    yield item.get("name", ""), item.get("input", {}) or {}
+            if event.get("type") == "assistant":  # claude stream-json
+                for item in event.get("message", {}).get("content", []) or []:
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        yield item.get("name", ""), item.get("input", {}) or {}
+            elif event.get("type") == "item.completed":  # codex exec --json
+                yield from codex_tool_uses(event.get("item") or {})
 
     def bash_commands(self, turn=None):
         return [i.get("command", "") for n, i in self.tool_uses(turn) if n in ("Bash", "PowerShell")]
@@ -67,6 +88,15 @@ class Context:
                 names.append(str(data.get("skill") or data.get("command") or data.get("name") or ""))
         return names
 
+    def subagents(self, turn=None):
+        """Descriptions of dispatched subagents (Claude Agent/Task tool, Codex spawn_agent)."""
+        found = []
+        for name, data in self.tool_uses(turn):
+            if name in ("Agent", "Task", "spawn_agent"):
+                found.append(" ".join(str(data.get(k) or "") for k in
+                                      ("subagent_type", "agent_type", "task_name", "fork_turns", "description", "message", "prompt")).strip()[:300])
+        return found
+
     def final_text(self, turn=-1):
         if not self.transcripts:
             return ""
@@ -74,6 +104,8 @@ class Context:
         for event in self.events(turn if turn >= 0 else len(self.transcripts) - 1):
             if event.get("type") == "result":
                 result = event.get("result") or ""
+            elif event.get("type") == "item.completed" and (event.get("item") or {}).get("type") == "agent_message":
+                result = event["item"].get("text") or ""  # codex: last agent message of the turn
         return result
 
     def ran(self, pattern, turn=None):
@@ -150,10 +182,22 @@ def ran_tests(ctx, turn=None):
 
 
 def baseline_before_edit(ctx, required=False):
-    first_edit = ctx.first_index(lambda n, d: n in ("Edit", "Write", "MultiEdit", "NotebookEdit"))
+    first_edit = ctx.first_index(lambda n, d: n in ("Edit", "Write", "MultiEdit", "NotebookEdit")
+                                 and ".dev-flow" not in str(d.get("file_path", "")))  # state files aren't code
     first_test = ctx.first_index(lambda n, d: n in ("Bash", "PowerShell") and re.search(r"unittest|pytest", d.get("command", "")))
     ok = first_test is not None and (first_edit is None or first_test < first_edit)
     return Check("修改前先跑基线", ok, f"首次测试#{first_test} 首次编辑#{first_edit}", required)
+
+
+def evidence_recorded(ctx, turn=None):
+    runs, reports = ctx.ran(r"evidence\.py\S*\s+run\b", turn), ctx.ran(r"evidence\.py\S*\s+report\b", turn)
+    return [Check("用 evidence.py run 记录验证", bool(runs), f"{len(runs)} 次", required=False),
+            Check("用 evidence.py report 生成证据表", bool(reports), f"{len(reports)} 次", required=False)]
+
+
+def independent_review(ctx, turn=None):
+    found = ctx.subagents(turn)
+    return Check("派发了独立审查子代理", bool(found), found[0][:120] if found else "未派发", required=False)
 
 
 def no_flow(ctx):
