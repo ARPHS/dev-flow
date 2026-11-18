@@ -41,6 +41,6 @@ def grade(ctx):
         no_commits(ctx),
         baseline_before_edit(ctx),
         skill_used(ctx, "df-flow"),
-        Check("创建了 .flow/progress.md", (ctx.ws / ".flow" / "progress.md").exists(), required=False),
+        Check("创建了 .dev-flow/progress.md", (ctx.ws / ".dev-flow" / "progress.md").exists(), required=False),
         Check("报告包含退出码", any(k in ctx.final_text() for k in ("退出码", "exit")), required=False),
     ]

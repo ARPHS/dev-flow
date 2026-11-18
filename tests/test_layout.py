@@ -3,7 +3,8 @@ import re
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[1]
+ROOT = REPO / "plugins/dev-flow"  # plugin root; marketplaces stay at the repo root
 SKILLS = {"df-flow", "df-plan", "df-review", "df-debug", "df-verify"}
 
 
@@ -25,8 +26,13 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(root_manifest["name"], "dev-flow")
         self.assertEqual(claude_manifest["name"], root_manifest["name"])
         self.assertEqual(claude_manifest["version"], root_manifest["version"])
-        self.assertEqual(read_json(ROOT / ".agents/plugins/marketplace.json")["plugins"][0]["name"], "dev-flow")
-        self.assertEqual(read_json(ROOT / ".claude-plugin/marketplace.json")["plugins"][0]["name"], "dev-flow")
+        # Codex reads OpenAI-specific settings from the root manifest; no .codex-plugin overlay.
+        self.assertTrue(root_manifest["extensions"]["com.openai"]["interface"]["displayName"])
+        self.assertFalse((ROOT / ".codex-plugin").exists())
+        self.assertEqual((ROOT / "LICENSE").read_bytes(), (REPO / "LICENSE").read_bytes(),
+                         "installed copy of LICENSE must match the repo's")
+        self.assertEqual(read_json(REPO / ".agents/plugins/marketplace.json")["plugins"][0]["name"], "dev-flow")
+        self.assertEqual(read_json(REPO / ".claude-plugin/marketplace.json")["plugins"][0]["name"], "dev-flow")
         names = set()
         for relative in claude_manifest["agents"]:
             meta = frontmatter(ROOT / relative)
@@ -58,9 +64,14 @@ class LayoutTest(unittest.TestCase):
         for marker in ("【分级】", "【基线】", "project 必须停顿", "df-verify", "df-reviewer"):
             self.assertIn(marker, flow)
 
+    def test_single_cli_entry(self):
+        scripts = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "skills").rglob("scripts/*.py"))
+        self.assertEqual(scripts, ["skills/df-verify/scripts/evidence.py"],
+                         "workflow logic belongs in skills; extend evidence.py instead of adding scripts")
+
     def test_no_project_runtime_config(self):
-        self.assertFalse((ROOT / "CLAUDE.md").exists())
-        self.assertFalse((ROOT / ".claude").exists())
+        self.assertFalse((REPO / "CLAUDE.md").exists())
+        self.assertFalse((REPO / ".claude").exists())
         self.assertFalse((ROOT / "hooks").exists(), "hooks must stay opt-in, not auto-installed")
 
 

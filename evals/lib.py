@@ -157,7 +157,7 @@ def baseline_before_edit(ctx, required=False):
 
 
 def no_flow(ctx):
-    return Check("未创建 .flow/", not (ctx.ws / ".flow").exists())
+    return Check("未创建 .dev-flow/", not (ctx.ws / ".dev-flow").exists())
 
 
 def skill_used(ctx, name, required=False, expect=True):
@@ -167,4 +167,4 @@ def skill_used(ctx, name, required=False, expect=True):
 
 
 def code_files(files):
-    return [f for f in files if Path(f).suffix in CODE_SUFFIXES and not f.startswith(".flow/")]
+    return [f for f in files if Path(f).suffix in CODE_SUFFIXES and not f.startswith(".dev-flow/")]

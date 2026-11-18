@@ -15,7 +15,7 @@ def grade(ctx):
         Check("包含测试文件", bool(tests), ", ".join(tests[:3])),
         Check("包含 README", readme is not None and readme.exists()),
         no_commits(ctx),
-        Check("创建了 .flow/task.md", (ctx.ws / ".flow" / "task.md").exists(), required=False),
+        Check("创建了 .dev-flow/task.md", (ctx.ws / ".dev-flow" / "task.md").exists(), required=False),
     ]
     if len(ctx.transcripts) > 1:
         checks.append(ran_tests(ctx, turn=1))

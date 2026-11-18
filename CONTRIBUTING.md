@@ -11,6 +11,7 @@
 ```powershell
 python -X utf8 -m unittest discover -s tests
 claude plugin validate . --strict
+claude plugin validate plugins/dev-flow --strict
 ```
 
 ## 行为评测

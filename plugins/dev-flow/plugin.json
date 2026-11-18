@@ -1,0 +1,34 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dev-flow",
+  "version": "0.2.0",
+  "description": "按任务风险推进软件开发、验证和收尾的轻量工作流",
+  "author": {
+    "name": "dev-flow contributors"
+  },
+  "repository": "https://github.com/ARPHS/dev-flow",
+  "license": "MIT",
+  "keywords": [
+    "software-engineering",
+    "coding-agent",
+    "verification",
+    "debugging"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Dev Flow",
+        "shortDescription": "按风险推进开发，用程序记录的证据收尾",
+        "longDescription": "按任务风险分级推进开发：先取基线，再切片实现，最后由 evidence.py 记录的验证结果和独立审查收尾。包含规划、调试、验证和审查技能。",
+        "developerName": "dev-flow contributors",
+        "category": "Developer Tools",
+        "capabilities": ["Interactive", "Read", "Write"],
+        "websiteURL": "https://github.com/ARPHS/dev-flow",
+        "defaultPrompt": [
+          "用 dev-flow 给这个项目加一个新功能，并在结束前给出验证证据。",
+          "用 dev-flow 排查这个偶发的缺陷。"
+        ]
+      }
+    }
+  }
+}

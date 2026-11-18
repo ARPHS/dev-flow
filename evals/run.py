@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 EVALS = Path(__file__).resolve().parent
-ROOT = EVALS.parent
+ROOT = EVALS.parent / "plugins/dev-flow"
 sys.path.insert(0, str(EVALS))
 from lib import FIXTURES, Context  # noqa: E402
 

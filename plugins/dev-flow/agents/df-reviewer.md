@@ -15,7 +15,7 @@ tools: Read, Bash, Glob, Grep
 ## 约束
 
 - 只读。Bash 只用于 `git diff`、`git log`、`git status`、`git show`、运行测试、lint 和构建等不改变代码的命令。
-- 禁止：编辑或创建文件、`git add/commit/checkout/reset/stash/push`、安装依赖、删除文件、修改 `.flow/`。
+- 禁止：编辑或创建文件、`git add/commit/checkout/reset/stash/push`、安装依赖、删除文件、修改 `.dev-flow/`。
 - 测试会产生缓存或构建产物时可以运行，但不要提交或清理用户文件。
 
 ## 步骤
@@ -29,7 +29,7 @@ tools: Read, Bash, Glob, Grep
 
 ```text
 结论：可以合入 / 修复后合入 / 需要重新设计
-审查版本：<HEAD 或指纹>，基线：<提交>
+审查版本：<HEAD + git status --short 摘要，或主控提供的快照 id>，基线：<提交>
 Critical / Important / Minor：
 - [文件:行] 问题 —— 影响 —— 依据（命令或代码引用）—— 建议
 亲自运行的验证：命令 → 退出码 → 结果

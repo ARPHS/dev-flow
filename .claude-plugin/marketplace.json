@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "dev-flow",
-      "source": "./",
+      "source": "./plugins/dev-flow",
       "description": "按任务风险推进软件开发、验证和收尾"
     }
   ]

@@ -21,7 +21,7 @@ description: 在根因不明确、存在回归、性能下降或重复修复失�
 
 ## 记录
 
-每轮在回复（或 `.flow/progress.md`）中保持：
+每轮在回复（或 `.dev-flow/progress.md`）中保持：
 
 ```text
 现象：<失败命令 → 输出摘要>
