@@ -136,7 +136,12 @@ class EvidenceTest(unittest.TestCase):
         git(repo, "init", "-q")
         (repo / ".dev-flow").mkdir()
         (repo / "main.py").write_text("print(1)\n", encoding="utf-8")
-        self.assertTrue(evidence.fingerprint(repo))
+        first = evidence.fingerprint(repo)  # no index file at all
+        (repo / "main.py").write_text("print(2)\n", encoding="utf-8")
+        self.assertNotEqual(evidence.fingerprint(repo), first)
+        git(repo, "add", "main.py")
+        git(repo, "rm", "-q", "--cached", "main.py")  # index file exists but has no entries
+        self.assertNotEqual(evidence.fingerprint(repo), first)
 
     def test_large_untracked_files_left_out(self):
         with mock.patch.object(evidence, "LARGE_FILE", 10):

@@ -103,7 +103,9 @@ def snapshot(root, objects):
             # and a newer mtime would make same-size edits within one second look unchanged.
             shutil.copy2(real, index)
         env["GIT_INDEX_FILE"] = str(index)
-        git(["add", "-u", "--", ".", EXCLUDE], root, env)
+        # git 2.4x rejects `add -u <pathspec>` when no tracked file matches (e.g. no commits yet)
+        if git(["ls-files", "-z", "--", ".", EXCLUDE], root, env):
+            git(["add", "-u", "--", ".", EXCLUDE], root, env)
         listed = git(["ls-files", "--others", "--exclude-standard", "-z", "--", ".", EXCLUDE], root, env)
         small, large = [], []
         for name in (n for n in listed.split(b"\0") if n):
