@@ -10,7 +10,7 @@ Subcommands:
     fingerprint          print the snapshot id (git tree hash) of the current working tree
 
 A snapshot is a git tree of the working tree (tracked changes + untracked, non-ignored
-files, excluding .dev-flow/) built in a throwaway index. Everything is written inside
+files, excluding .dev-flow/ and caches such as __pycache__) built in a throwaway index. Everything is written inside
 .dev-flow/ (objects, temporary index), never into the project's .git or %TEMP%, so it
 also works in sandboxes that only allow writing to the workspace. The tool only reports
 facts; whether a change invalidates a record is decided by the df-verify skill.
@@ -31,7 +31,9 @@ from datetime import datetime
 from pathlib import Path
 
 STATE = ".dev-flow"
-EXCLUDE = f":(exclude){STATE}"
+CACHES = ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache")
+# snapshot scope: the work tree minus .dev-flow/ and tool caches that running checks rewrite
+SCOPE = [".", f":(exclude){STATE}", *(f":(exclude,glob)**/{name}/**" for name in CACHES)]
 LARGE_FILE = 10 * 1024 * 1024    # untracked files above this are left out of snapshots
 OBJECTS_CAP = 200 * 1024 * 1024  # .dev-flow/objects is cleared when it grows past this
 TAIL_LINES = 15
@@ -104,9 +106,9 @@ def snapshot(root, objects):
             shutil.copy2(real, index)
         env["GIT_INDEX_FILE"] = str(index)
         # git 2.4x rejects `add -u <pathspec>` when no tracked file matches (e.g. no commits yet)
-        if git(["ls-files", "-z", "--", ".", EXCLUDE], root, env):
-            git(["add", "-u", "--", ".", EXCLUDE], root, env)
-        listed = git(["ls-files", "--others", "--exclude-standard", "-z", "--", ".", EXCLUDE], root, env)
+        if git(["ls-files", "-z", "--", *SCOPE], root, env):
+            git(["add", "-u", "--", *SCOPE], root, env)
+        listed = git(["ls-files", "--others", "--exclude-standard", "-z", "--", *SCOPE], root, env)
         small, large = [], []
         for name in (n for n in listed.split(b"\0") if n):
             path = root / name.decode("utf-8", "surrogateescape")

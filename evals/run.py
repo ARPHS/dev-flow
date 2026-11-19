@@ -277,24 +277,27 @@ def grade_case(case_dir):
         checks = [c.to_dict() for c in load_grader(meta["case"])(ctx)]
     except Exception as exc:  # grader crash is a failure, not a runner crash
         checks = [{"name": "grader 运行", "ok": False, "detail": repr(exc), "required": True}]
+    commands, failed = ctx.command_stats()
     required = [c for c in checks if c["required"]]
     soft = [c for c in checks if not c["required"]]
     result = {
         "case": meta["case"], "passed": all(c["ok"] for c in required),
         "required": f"{sum(c['ok'] for c in required)}/{len(required)}",
         "soft": f"{sum(c['ok'] for c in soft)}/{len(soft)}",
-        "stats": meta["stats"], "checks": checks,
+        "stats": {**meta["stats"], "commands": commands, "failed_commands": failed}, "checks": checks,
     }
     (case_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
 
 
 def summarize(results, out):
-    lines = ["| 用例 | 结果 | 必需 | 参考 | 耗时(s) | 成本($) | tokens |", "|---|---|---|---|---|---|---|"]
+    lines = ["| 用例 | 结果 | 必需 | 参考 | 耗时(s) | 命令 | 失败命令 | 成本($) | tokens |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for r in results:
         s = r["stats"]
         lines.append(f"| {r['case']} | {'✅' if r['passed'] else '❌'} | {r['required']} | {r['soft']} "
-                     f"| {s['seconds']:.0f} | {s['cost_usd']:.2f} | {s.get('tokens', 0)} |")
+                     f"| {s['seconds']:.0f} | {s.get('commands', 0)} | {s.get('failed_commands', 0)} "
+                     f"| {s['cost_usd']:.2f} | {s.get('tokens', 0)} |")
     lines.append("")
     for r in results:
         for c in r["checks"]:

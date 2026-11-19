@@ -26,7 +26,7 @@ description: 在动手读写代码之前先调用：用户要求实现或修改�
 - `feature`：多文件功能、普通缺陷、需要新增测试或多轮验证。
 - `project`：新项目、架构重组、**破坏兼容**的公共接口或数据格式变化、数据迁移、新的认证授权或安全边界、有明确指标的性能目标、不可逆操作。向后兼容的新增（加字段、加参数、给已有鉴权体系加一个检查）属于 `feature`。
 
-判定细则见 [route.md](references/route.md)。用户要求只讨论、规划或审查时，只做对应范围。
+拿不准级别时再读判定细则 [route.md](references/route.md)，能直接判断就不必读。用户要求只讨论、规划或审查时，只做对应范围。
 
 `feature` 和 `project` 开工前输出：
 
@@ -54,7 +54,7 @@ description: 在动手读写代码之前先调用：用户要求实现或修改�
 3. 读取失败的完整证据，定位根因，修复范围内问题并重复受影响的验证。根因不明时转入 `df-debug`。
 4. 每完成一个切片：运行该切片验证，更新 `.dev-flow/progress.md`（`feature`、`project`），再开始下一个切片。
 
-详细循环、检查点和依赖策略见 [loop.md](references/loop.md)，质量门禁见 [quality.md](references/quality.md)。
+项目没有测试设施、需要新增或升级依赖、反复失败或中断恢复时读 [loop.md](references/loop.md)。按改动类型选择证据见质量门禁 [quality.md](references/quality.md)。
 
 ## 第四步：验证、审查、收尾
 

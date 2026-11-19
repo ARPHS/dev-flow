@@ -167,6 +167,7 @@ class EvalCasesTest(unittest.TestCase):
         self.assertTrue(ctx.ran(r"unittest"))
         self.assertEqual(ctx.final_text(), "完成，退出码 0")
         self.assertIn("df-reviewer", ctx.subagents()[0])
+        self.assertEqual(ctx.command_stats(), (2, 0))
         dispatched, waited = lib.independent_review(ctx)
         self.assertEqual((dispatched.ok, waited.ok), (True, False))  # spawned but never waited
         test_index = ctx.first_index(lambda n, d: n == "Bash" and "unittest" in d["command"])
@@ -185,6 +186,20 @@ class EvalCasesTest(unittest.TestCase):
         ctx = Context(ws=Path(self.tmp.name), fixture=FIXTURES / "ledger", base="", transcripts=[transcript])
         runs, reports = lib.evidence_recorded(ctx)
         self.assertEqual((runs.ok, runs.detail, reports.ok, reports.detail), (True, "1 次", True, "1 次"))
+
+    def test_claude_command_stats(self):
+        def event(kind, item):
+            return json.dumps({"type": kind, "message": {"content": [item]}})
+        transcript = "\n".join([
+            event("assistant", {"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "ok"}}),
+            event("user", {"type": "tool_result", "tool_use_id": "a", "content": "fine"}),
+            event("assistant", {"type": "tool_use", "id": "b", "name": "PowerShell", "input": {"command": "bad"}}),
+            event("user", {"type": "tool_result", "tool_use_id": "b", "is_error": True, "content": "exit 1"}),
+            event("assistant", {"type": "tool_use", "id": "c", "name": "Read", "input": {}}),
+            event("user", {"type": "tool_result", "tool_use_id": "c", "is_error": True, "content": "missing"}),
+        ])
+        ctx = Context(ws=Path(self.tmp.name), fixture=FIXTURES / "ledger", base="", transcripts=[transcript])
+        self.assertEqual(ctx.command_stats(), (2, 1))  # only shell tools count
 
 
 class RunTurnTests(unittest.TestCase):

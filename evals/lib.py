@@ -81,6 +81,25 @@ class Context:
     def bash_commands(self, turn=None):
         return [i.get("command", "") for n, i in self.tool_uses(turn) if n in ("Bash", "PowerShell")]
 
+    def command_stats(self, turn=None):
+        """(shell commands run, commands that failed): a cheap proxy for wasted round trips."""
+        shell_ids, total, failed = set(), 0, 0
+        for event in self.events(turn):
+            kind = event.get("type")
+            if kind in ("assistant", "user"):  # claude: tool_use, then tool_result with is_error
+                for item in event.get("message", {}).get("content", []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "tool_use" and item.get("name") in ("Bash", "PowerShell"):
+                        total += 1
+                        shell_ids.add(item.get("id"))
+                    elif item.get("type") == "tool_result" and item.get("is_error") and item.get("tool_use_id") in shell_ids:
+                        failed += 1
+            elif kind == "item.completed" and (event.get("item") or {}).get("type") == "command_execution":
+                total += 1
+                failed += event["item"].get("exit_code") not in (0, None)
+        return total, failed
+
     def skills_invoked(self, turn=None):
         names = []
         for name, data in self.tool_uses(turn):

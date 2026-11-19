@@ -65,6 +65,9 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual(self.fp(), first, "same tree must give same id")
         self.write(".dev-flow/notes.md", "state")
         self.write("ignored/cache.bin", "cache")
+        self.write("__pycache__/a.cpython-313.pyc", "pyc")  # not gitignored, yet rewritten by every run
+        self.write("pkg/__pycache__/b.pyc", "pyc")
+        self.write(".pytest_cache/v/cache/lastfailed", "{}")
         self.assertEqual(self.fp(), first)
         self.write("a.py", "x = 2\n")
         modified = self.fp()
