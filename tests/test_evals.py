@@ -167,6 +167,8 @@ class EvalCasesTest(unittest.TestCase):
         self.assertTrue(ctx.ran(r"unittest"))
         self.assertEqual(ctx.final_text(), "完成，退出码 0")
         self.assertIn("df-reviewer", ctx.subagents()[0])
+        dispatched, waited = lib.independent_review(ctx)
+        self.assertEqual((dispatched.ok, waited.ok), (True, False))  # spawned but never waited
         test_index = ctx.first_index(lambda n, d: n == "Bash" and "unittest" in d["command"])
         edit_index = ctx.first_index(lambda n, d: n == "Edit")
         self.assertLess(test_index, edit_index)

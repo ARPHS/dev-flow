@@ -30,7 +30,7 @@ python -X utf8 evals/run.py --agent codex           # 用 Codex CLI 运行
 - 把 `CODEX_HOME` 指向一个专用于评测的目录，其中 `config.toml` 只保留模型、认证和 `[windows] sandbox` 等设置，不要带 MCP 服务器、notify 或 `sandbox_mode = "danger-full-access"`。
 - 运行器会先从当前工作树重新安装插件（Codex 从缓存加载插件，不重装就会测到旧版本）；`--no-plugin` 会卸载插件（`-c` 覆盖 `enabled=false` 不生效），之后不带该参数运行时会自动重装。
 - 每轮在出现结束事件（Codex `turn.completed`、Claude `result`）后最多再等 30 秒，进程仍未退出（例如后台子代理未结束）就结束整棵进程树；超时同样结束整棵进程树，原因写入 `turnN.stderr.txt`。
-- agent 在默认的 `workspace-write` 沙箱中运行，后续轮次通过线程 id 续接。Codex 没有 Skill 工具，"调用技能"按读取 `df-*/SKILL.md` 的命令判断；成本列为 0，用 tokens 列代替。
+- agent 在默认的 `workspace-write` 沙箱中运行，后续轮次通过线程 id 续接。Codex 没有 Skill 工具，"调用技能"按读取 `df-*/SKILL.md` 的命令判断；成本列为 0，用 tokens 列代替。tokens 取自 `turn.completed` 的 usage，经第三方代理转发的模型可能只上报部分请求，这时以耗时和命令数比较。
 
 结果默认写入系统临时目录下的 `dev-flow-evals/<时间>/`，其中包含每个用例的工作区、每轮的 `turnN.jsonl` 原始记录、`result.json` 和汇总 `summary.md`。
 

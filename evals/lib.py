@@ -201,7 +201,11 @@ def evidence_recorded(ctx, turn=None):
 
 def independent_review(ctx, turn=None):
     found = ctx.subagents(turn)
-    return Check("派发了独立审查子代理", bool(found), found[0][:120] if found else "未派发", required=False)
+    checks = [Check("派发了独立审查子代理", bool(found), found[0][:120] if found else "未派发", required=False)]
+    names = [n for n, _ in ctx.tool_uses(turn)]
+    if "spawn_agent" in names:  # codex: the report must wait for the reviewer
+        checks.append(Check("等待了审查结果", "wait_agent" in names, "", required=False))
+    return checks
 
 
 def no_flow(ctx):

@@ -18,5 +18,5 @@ def grade(ctx):
         Check("创建了 .dev-flow/task.md", (ctx.ws / ".dev-flow" / "task.md").exists(), required=False),
     ]
     if len(ctx.transcripts) > 1:
-        checks += [ran_tests(ctx, turn=1), *evidence_recorded(ctx, turn=1), independent_review(ctx, turn=1)]
+        checks += [ran_tests(ctx, turn=1), *evidence_recorded(ctx, turn=1), *independent_review(ctx, turn=1)]
     return checks

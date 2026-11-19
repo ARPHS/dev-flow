@@ -12,7 +12,7 @@ description: 在动手读写代码之前先调用：用户要求实现或修改�
 以下规则不因任务紧急或"看起来很简单"而豁免：
 
 1. **先声明分级**：开始写代码前输出下方"开工声明"，用户可据此纠正。
-2. **先跑基线**：`feature`、`project` 在修改代码前取得基线：现有测试、lint/类型检查和构建的结果。代码未变时可复用最近一次全量验证，全量很慢时可先跑局部，规则见 [loop.md](references/loop.md#基线)。
+2. **先跑基线**：`feature`、`project` 在修改代码前先创建 `.dev-flow/`（见[状态和协作](#状态和协作)），再取得基线：现有测试、lint/类型检查和构建的结果。代码未变时可复用最近一次全量验证，全量很慢时可先跑局部，规则见 [loop.md](references/loop.md#基线)。
 3. **project 必须停顿**：`project` 级别输出设计后，以"请确认或修改以上方案"结束本轮回复，等待用户回答；确认前除 `.dev-flow/` 外不创建或修改任何文件（包括测试）。例外只有两种：用户已确认过方案（含 `df-plan` 已批准的计划），或明确说了"不用确认，直接做"；自己判断"需求已经很明确"不算例外。`quick`、`feature` 不因阶段切换而停顿。
 4. **没有证据不说完成**：`feature`、`project` 的完成声明必须来自 `df-verify` 技能（`evidence.py run` / `report`）产生的、对应当前代码的运行结果；`quick` 至少在最后一次修改后运行一项适用检查，并给出命令和退出码。
 5. **不制造通过**：不减弱断言、删除或跳过测试、吞掉错误、绕过真实入口。
@@ -52,7 +52,7 @@ description: 在动手读写代码之前先调用：用户要求实现或修改�
 1. 先打通一条真实入口或建立最小复现，尽早取得运行反馈。
 2. 按纵向行为切片实现。能用行为测试表达的改动，先让测试因预期原因失败，再做最小实现。测试不适用时使用真实 CLI、API、UI 或配置检查。
 3. 读取失败的完整证据，定位根因，修复范围内问题并重复受影响的验证。根因不明时转入 `df-debug`。
-4. 每完成一个切片：运行该切片验证，更新 `.dev-flow/progress.md`（若存在），再开始下一个切片。
+4. 每完成一个切片：运行该切片验证，更新 `.dev-flow/progress.md`（`feature`、`project`），再开始下一个切片。
 
 详细循环、检查点和依赖策略见 [loop.md](references/loop.md)，质量门禁见 [quality.md](references/quality.md)。
 
@@ -62,7 +62,7 @@ description: 在动手读写代码之前先调用：用户要求实现或修改�
 2. 审查：
    - `quick`：自查 diff。
    - `feature`：自查完整 diff 和未跟踪文件；改动超过约 300 行或涉及 5 个以上文件时，按下一条做独立审查。
-   - `project`：**必须**做独立审查。在新上下文中运行 `df-reviewer`（Claude Code 直接调用该子代理，Codex 用 `spawn_agent` 派发，见 [team.md](references/team.md#按运行环境派发)），传入基线提交、验收条件和验证证据；没有子代理能力时，按 `df-review` 的步骤逐项审查并在报告中注明"非独立审查"。
+   - `project`：**必须**做独立审查。在新上下文中运行 `df-reviewer`（Claude Code 直接调用该子代理，Codex 用 `spawn_agent` 派发，见 [team.md](references/team.md#按运行环境派发)），传入基线提交、验收条件和验证证据，**等审查结果返回后**再写最终报告；没有子代理能力时，按 `df-review` 的步骤逐项审查并在报告中注明"非独立审查"。
 3. Critical、Important 问题修复后重新验证，Minor 记录即可。
 4. 在回复中完整输出最终报告，证据表原样贴出；只写进 `.dev-flow/` 或其他文件、回复里只给摘要，都不算完成报告：
 
@@ -85,6 +85,6 @@ description: 在动手读写代码之前先调用：用户要求实现或修改�
 
 ## 状态和协作
 
-`feature` 和 `project` 在取基线之前必须创建 `.dev-flow/`（连同内容为 `*` 的 `.gitignore`，不会出现在 `git status` 中）：`df-verify` 的证据工具只在该目录存在时记录，不创建就没有可复核的证据。`quick` 不创建。格式、模板和更新时机见 [state.md](references/state.md)。恢复时先对照真实文件、Git 状态和命令结果，不能只相信旧记录。
+`feature` 和 `project` 在取基线之前必须创建 `.dev-flow/`（连同内容为 `*` 的 `.gitignore`，不会出现在 `git status` 中）：`df-verify` 的证据工具只在该目录存在时记录，不创建就没有可复核的证据。同时写入 `task.md`（目标、验收条件、切片）和 `progress.md`（基线结果、当前状态、下一步），之后每个切片完成、被阻塞或结束会话前更新 `progress.md`。`quick` 不创建。格式、模板和更新时机见 [state.md](references/state.md)。恢复时先对照真实文件、Git 状态和命令结果，不能只相信旧记录。
 
 默认由一个 agent 连续完成。只有并行能降低总成本、工作区可以隔离或需要独立审查时才调用代理，规则见 [team.md](references/team.md)。

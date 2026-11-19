@@ -26,6 +26,8 @@ $EV run -l lint -- npm run lint
 
 需要管道、`&&`、设置环境变量等 shell 特性时，显式包一层：`-- bash -c "LEDGER_FILE=/tmp/l.json python -m ledger list"`，或 `-- pwsh -NoProfile -Command "..."`。不要把整条命令放进一对引号里传给 `run`，它会报错提示。Windows PowerShell 5.1 会丢掉传给外部程序的参数里嵌套的双引号，包装命令内部改用单引号，或改用 `pwsh`（7.x）。
 
+Codex 的 Windows 沙箱中，Python 3.12.4 及以上用 `tempfile.mkdtemp`、`TemporaryDirectory` 创建的目录（位置不限，工作区内也一样）随后无法访问，相关测试会报 `PermissionError`。这是环境阻碍，不是代码缺陷：不要为绕开沙箱改写项目测试，申请提权后重跑；无法提权时把这些检查列入"未运行的检查"。沙箱里删不掉的残留目录在最终报告中列出，请用户手动删除。
+
 快照对象只写入 `.dev-flow/objects`，不写进项目的 `.git`，也不改动暂存区。只有存在 `.dev-flow/` 时才会记录：`feature`、`project` 任务必须已有该目录（由 `df-flow` 创建，缺失时先创建，并写入内容为 `*` 的 `.dev-flow/.gitignore`）；`quick` 或单独验证且没有该目录时，直接运行命令即可。
 
 ## 步骤
