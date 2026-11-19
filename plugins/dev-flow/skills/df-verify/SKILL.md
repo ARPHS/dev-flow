@@ -26,7 +26,7 @@ $EV run -l lint -- npm run lint
 
 需要管道、`&&`、设置环境变量等 shell 特性时，显式包一层：`-- bash -c "LEDGER_FILE=/tmp/l.json python -m ledger list"`，或 `-- pwsh -NoProfile -Command "..."`。不要把整条命令放进一对引号里传给 `run`，它会报错提示。Windows PowerShell 5.1 会丢掉传给外部程序的参数里嵌套的双引号，包装命令内部改用单引号，或改用 `pwsh`（7.x）。
 
-Codex 的 Windows 沙箱中，Python 3.12.4 及以上用 `tempfile`（`mkdtemp`、`TemporaryDirectory`）创建的目录随后无法访问，表现为测试报 `PermissionError` / `WinError 5`，路径是 `tmp*` 目录。**第一次出现就判定为环境阻碍，停止排查**：改 `TEMP`/`TMP`、预建目录、写包装脚本重跑都无效，也不要改写项目测试。能申请提权就提权重跑；不能时把受影响的测试列入"未运行的检查"，验收条件改用真实入口（CLI、API 调用）验证。沙箱里删不掉的残留目录在最终报告中列出，请用户手动删除。
+Codex 的 Windows 沙箱中，Python 3.12.4 及以上用 `tempfile`（`mkdtemp`、`TemporaryDirectory`）创建的目录随后无法访问，表现为测试报 `PermissionError` / `WinError 5`，路径是 `tmp*` 目录。**第一次出现就判定为环境阻碍，停止排查**：改 `TEMP`/`TMP`、预建目录、写包装脚本重跑都无效，也不要改写项目测试。能申请提权就提权重跑；不能时把受影响的测试列入"未运行的检查"，验收条件改用真实入口（CLI、API 调用）验证。沙箱里删不掉的残留目录在最终报告中列出，请用户手动删除。git 报 `detected dubious ownership`（`elevated` 沙箱用户不是仓库所有者）同样是环境阻碍：给该命令设置环境变量 `GIT_CONFIG_COUNT=1`、`GIT_CONFIG_KEY_0=safe.directory`、`GIT_CONFIG_VALUE_0=*`，不要修改项目或全局的 git 配置，也不必阅读 `evidence.py` 源码排查。
 
 快照对象只写入 `.dev-flow/objects`，不写进项目的 `.git`，也不改动暂存区。只有存在 `.dev-flow/` 时才会记录：`feature`、`project` 任务必须已有该目录（由 `df-flow` 创建，缺失时先创建，并写入内容为 `*` 的 `.dev-flow/.gitignore`）；`quick` 或单独验证且没有该目录时，直接运行命令即可。
 

@@ -16,6 +16,34 @@
 
 开发本插件（运行 `tests/`、`evals/`）另需 Python 3.8 及以上；`evals/run.py` 还需要已登录的 Claude Code CLI，会产生费用。
 
+### Codex 在 Windows 上的建议配置
+
+以下设置不是插件必需的，但能明显减少 Codex 在 Windows 上的无效往返（编码出错重试、沙箱权限错误后反复绕行）。在 `~/.codex/config.toml` 中加入，放在 `[features]` 等表之前：
+
+```toml
+[shell_environment_policy]
+# 只作用于 Codex 执行的命令：Python 默认 UTF-8；git 不检查仓库归属（elevated 沙箱用户与仓库所有者不同）
+set = { PYTHONUTF8 = "1", GIT_CONFIG_COUNT = "1", GIT_CONFIG_KEY_0 = "safe.directory", GIT_CONFIG_VALUE_0 = "*" }
+
+[windows]
+sandbox = "elevated"         # 使用独立的低权限沙箱用户，而不是从当前用户派生的受限令牌
+```
+
+- **`PYTHONUTF8`**：中文 Windows 默认代码页是 GBK，Python 打印中文到管道、`open()` 不指定编码时会出错或乱码，模型随后会反复换写法重试。
+- **`GIT_CONFIG_*`（`safe.directory = *`）**：`elevated` 沙箱中的命令以沙箱用户运行，而仓库属于你的账户，git 会报 `detected dubious ownership` 并拒绝执行，`evidence.py` 的快照也会失败。这三个变量等同于 `git -c safe.directory=*`，只对 Codex 执行的命令生效，不修改任何 gitconfig。代价是这些命令不再检查仓库归属（该检查用于防止在他人仓库中触发恶意 git 配置）；只在可信的工作区中使用 Codex 时影响很小。不用 `elevated` 沙箱时不需要。
+- **`elevated` 沙箱**：需要管理员一次性初始化（创建 `CodexSandboxOffline`、`CodexSandboxOnline` 用户、防火墙规则和目录权限）。`codex exec` 等非交互运行不会弹出授权窗口，请在**以管理员身份运行**的 PowerShell 中执行：
+
+  ```powershell
+  codex sandbox setup --elevated --current-user
+  # 使用其他 CODEX_HOME（例如评测专用目录）时，对该目录再执行一次
+  codex sandbox setup --elevated --user "$env:COMPUTERNAME\$env:USERNAME" --codex-home "<CODEX_HOME 路径>"
+  ```
+
+  初始化后第一次在沙箱中运行命令时，Codex 会在后台为沙箱用户授予系统目录的读取权限，可能持续数分钟，期间命令看起来没有响应，属于正常现象，只发生一次。支持 MXC 的设备（Windows 11 24H2 build 26100.9278 及以上）可以改用无需管理员的 `[features] prefer_mxc = true`，用 `codex -c windows.sandbox=mxc sandbox --permission-profile :workspace -- cmd.exe /d /c echo MXC_OK` 检查是否可用。
+  `elevated` 下 Python 3.12.4 及以上的 `tempfile` 目录可以正常读写（Codex CLI 0.169.1、Python 3.12.12 实测）。
+- **无法使用管理员权限时**保留 `sandbox = "unelevated"`。此模式下 Python 3.12.4 及以上用 `tempfile` 创建的目录在沙箱中无法访问，相关测试会报 `PermissionError`；`df-verify` 会把它当作环境阻碍，列入"未运行的检查"并改用真实入口验证，不会为此改写项目测试。
+- 全局使用 `sandbox_mode = "danger-full-access"` 时命令不经过沙箱，`[windows]` 设置不起作用；`PYTHONUTF8` 仍然有效。
+
 ## 安装
 
 ### Claude Code 本地试用

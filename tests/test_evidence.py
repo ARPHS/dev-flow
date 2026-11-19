@@ -1,3 +1,4 @@
+import io
 import os
 import shutil
 import subprocess
@@ -145,6 +146,17 @@ class EvidenceTest(unittest.TestCase):
         git(repo, "add", "main.py")
         git(repo, "rm", "-q", "--cached", "main.py")  # index file exists but has no entries
         self.assertNotEqual(evidence.fingerprint(repo), first)
+
+    def test_dubious_ownership_explained(self):
+        # Codex's elevated sandbox runs commands as another Windows user than the repo owner
+        error = evidence.GitError("fatal: detected dubious ownership in repository at 'C:/repo'")
+        with mock.patch.object(evidence, "repo_root", side_effect=error):
+            code, _, record, notes = evidence.run(py("print(1)")[1:], cwd=self.repo)
+            self.assertEqual((code, record), (0, None))
+            self.assertIn("safe.directory", notes[0])
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertEqual(evidence.main(["report"]), 1)
+            self.assertIn("GIT_CONFIG_KEY_0=safe.directory", err.getvalue())
 
     def test_large_untracked_files_left_out(self):
         with mock.patch.object(evidence, "LARGE_FILE", 10):

@@ -45,6 +45,15 @@ class GitError(RuntimeError):
     pass
 
 
+SAFE_DIRECTORY_HINT = ("仓库所有者与当前用户不同（例如 Codex elevated 沙箱的沙箱用户），git 拒绝访问。这是环境阻碍："
+                       "设置环境变量 GIT_CONFIG_COUNT=1、GIT_CONFIG_KEY_0=safe.directory、GIT_CONFIG_VALUE_0=* 后重跑"
+                       "（Codex 可写入 shell_environment_policy.set），不要修改项目的 git 配置")
+
+
+def git_hint(exc):
+    return SAFE_DIRECTORY_HINT if "dubious ownership" in str(exc) else None
+
+
 def git(args, cwd, env=None, stdin=None):
     proc = subprocess.run(["git", *args], cwd=cwd, input=stdin, capture_output=True,
                           env={**os.environ, **(env or {})})
@@ -192,7 +201,10 @@ def run(argv, label=None, cwd="."):
     command = display(argv)
     try:
         root = repo_root(cwd)
-    except (GitError, FileNotFoundError):
+    except GitError as exc:
+        hint = git_hint(exc)
+        return proc.returncode, output, None, [f"{hint}，未记录"] if hint else []
+    except FileNotFoundError:
         return proc.returncode, output, None, []
     if not (root / STATE).is_dir():
         return proc.returncode, output, None, []
@@ -293,7 +305,8 @@ def main(argv=None):
         print(f"evidence.py: {exc}", file=sys.stderr)
         return 1
     except (GitError, FileNotFoundError) as exc:
-        print(f"evidence.py: 需要在 Git 仓库中运行，且 git >= 2.31（{exc}）", file=sys.stderr)
+        message = git_hint(exc) or f"需要在 Git 仓库中运行，且 git >= 2.31（{exc}）"
+        print(f"evidence.py: {message}", file=sys.stderr)
         return 1
 
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
