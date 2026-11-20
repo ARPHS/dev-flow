@@ -157,7 +157,10 @@ def _is_completed_agent_state(state):
     if isinstance(state, str):
         return state.strip().lower() == "completed"
     if isinstance(state, dict):
-        if isinstance(state.get("completed"), str) and state["completed"].strip():
+        completed_val = state.get("completed")
+        if isinstance(completed_val, str) and completed_val.strip():
+            return True
+        if isinstance(completed_val, dict) and completed_val and not completed_val.get("error"):
             return True
         status_val = state.get("status") or state.get("state")
         if isinstance(status_val, str) and status_val.strip().lower() == "completed":

@@ -47,6 +47,7 @@ SCOPE = [
 ]
 LARGE_FILE = 10 * 1024 * 1024     # untracked files above this are left out of snapshots
 OBJECTS_CAP = 200 * 1024 * 1024   # .dev-flow/objects is cleared when it grows past this
+LOGS_CAP = 50 * 1024 * 1024       # oldest .dev-flow/logs/*.log are pruned past this
 TAIL_LINES = 15
 TAIL_CHARS = 2000
 MAX_STDOUT_CHARS = 12000          # outputs larger than this are saved to .dev-flow/logs/ and summarized
@@ -226,26 +227,44 @@ def relative_cwd(cwd, root):
 
 def summarize_output(output, exit_code, log_rel=None):
     """Condense huge outputs while preserving head, tail, and full log pointer."""
+    keep_head = 3000 if exit_code == 0 else 4000
+    keep_tail = 5000 if exit_code == 0 else 7000
+    max_summary = keep_head + keep_tail
     lines = output.splitlines()
     head_n = 20 if exit_code == 0 else 30
     tail_n = 40 if exit_code == 0 else 120
-    if len(lines) <= head_n + tail_n:
-        # Very long single/few lines: truncate middle by chars
-        keep_head = 3000 if exit_code == 0 else 4000
-        keep_tail = 5000 if exit_code == 0 else 7000
-        omitted = len(output) - keep_head - keep_tail
-        pointer = f"（完整日志：{log_rel}）" if log_rel else ""
-        return (f"{output[:keep_head]}\n"
-                f"... [已省略约 {omitted} 字符{pointer}] ...\n"
-                f"{output[-keep_tail:]}\n")
-    omitted_lines = len(lines) - head_n - tail_n
-    pointer = f"；完整日志：{log_rel}" if log_rel else ""
-    parts = [
-        "\n".join(lines[:head_n]),
-        f"... [已省略中间 {omitted_lines} 行 / 共 {len(output)} 字符{pointer}] ...",
-        "\n".join(lines[-tail_n:]),
-    ]
-    return "\n".join(parts) + "\n"
+    if len(lines) > head_n + tail_n:
+        head_text = "\n".join(lines[:head_n])
+        tail_text = "\n".join(lines[-tail_n:])
+        if len(head_text) + len(tail_text) <= max_summary:
+            omitted_lines = len(lines) - head_n - tail_n
+            pointer = f"；完整日志：{log_rel}" if log_rel else ""
+            return (f"{head_text}\n"
+                    f"... [已省略中间 {omitted_lines} 行 / 共 {len(output)} 字符{pointer}] ...\n"
+                    f"{tail_text}\n")
+    omitted = len(output) - keep_head - keep_tail
+    pointer = f"（完整日志：{log_rel}）" if log_rel else ""
+    return (f"{output[:keep_head]}\n"
+            f"... [已省略约 {omitted} 字符{pointer}] ...\n"
+            f"{output[-keep_tail:]}\n")
+
+
+def prune_logs(logs_dir, keep_path):
+    """Drop oldest .log files when .dev-flow/logs exceeds LOGS_CAP (never removing keep_path)."""
+    files = sorted((p for p in logs_dir.glob("*.log") if p.is_file()),
+                   key=lambda p: p.stat().st_mtime)
+    total = sum(p.stat().st_size for p in files)
+    for old in files:
+        if total <= LOGS_CAP:
+            break
+        if old == keep_path:
+            continue
+        try:
+            size = old.stat().st_size
+            old.unlink()
+            total -= size
+        except OSError:
+            continue
 
 
 def save_log(root, label, output):
@@ -255,6 +274,7 @@ def save_log(root, label, output):
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = logs_dir / f"{stamp}-{safe_label}-{secrets.token_hex(3)}.log"
     log_path.write_text(output, encoding="utf-8")
+    prune_logs(logs_dir, log_path)
     return log_path.relative_to(root).as_posix()
 
 
@@ -454,6 +474,7 @@ def doctor(cwd="."):
     checks.append({"name": "git_repo", "ok": repo_ok, "detail": repo_detail})
 
     state_info = {"present": False, "gitignore_ok": False, "project_md": False, "evidence_count": 0}
+    state_ok = True
     if root is not None:
         state_dir = root / STATE
         if state_dir.is_dir():
@@ -462,21 +483,24 @@ def doctor(cwd="."):
             state_info["gitignore_ok"] = gi.is_file() and "*" in gi.read_text(encoding="utf-8", errors="replace").splitlines()
             state_info["project_md"] = (state_dir / "project.md").is_file()
             state_info["evidence_count"] = len(load_records(root))
+            state_ok = state_info["gitignore_ok"]
             state_detail = (f"已存在（.gitignore={'OK' if state_info['gitignore_ok'] else '缺失'}, "
                             f"project.md={'有' if state_info['project_md'] else '无'}, "
                             f"证据记录={state_info['evidence_count']}）")
         else:
             state_detail = "未创建（quick 任务无需创建；feature/project 开工前创建）"
-        checks.append({"name": "state_dir", "ok": True, "detail": state_detail})
+        checks.append({"name": "state_dir", "ok": state_ok, "detail": state_detail})
 
     tips = []
+    if state_info["present"] and not state_info["gitignore_ok"]:
+        tips.append(f"请创建包含 `*` 的 {STATE}/.gitignore，避免台账、日志和快照文件出现在 git status 中")
     if os.name == "nt" and os.environ.get("PYTHONUTF8") != "1":
         tips.append("Windows 环境建议设置 PYTHONUTF8=1，避免中文输出或文件读写出现 GBK 编码问题")
     if os.name != "nt":
         tips.append("Linux/WSL 环境使用 Bash 与 Linux 路径；无 python 命令时改用 python3")
 
     return {
-        "ok": py_ok and git_ok and repo_ok,
+        "ok": py_ok and git_ok and repo_ok and state_ok,
         "platform": sys.platform,
         "checks": checks,
         "state": state_info,

@@ -33,9 +33,10 @@ def json_output(ctx):
 
 def cli_json_invoked(ctx):
     hits = [execution for execution in ctx.shell_executions()
-            if invokes_python_module(execution["command"], "ledger", "list", "--json")]
+            if any(invokes_python_module(argv, "ledger", "list", "--json") for argv in execution["argvs"])]
     passing = [execution for execution in hits if execution_succeeded(execution)]
-    unknown = bool(hits) and not passing and any(execution["exit_code"] is None for execution in hits)
+    unknown = bool(hits) and not passing and any(
+        execution["exit_code"] is None or not execution["output_present"] for execution in hits)
     return Check("真实调用了 --json", bool(passing),
                  passing[0]["command"][:120] if passing else "未发现成功完成的 ledger list --json 调用",
                  category="functional", status="unknown" if unknown else "")

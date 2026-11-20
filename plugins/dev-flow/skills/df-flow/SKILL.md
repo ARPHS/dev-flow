@@ -59,8 +59,8 @@ description: 在动手读写代码之前先调用：用户要求实现或修改�
 
 ## 第四步：验证、审查、收尾
 
-1. `feature`、`project` 按 `df-verify` 技能执行验证（本会话尚未加载时再调用 Skill 工具或读取 [../df-verify/SKILL.md](../df-verify/SKILL.md)；已加载则直接沿用，不重复全文读取），更新 `progress.md` 状态为 `verifying`，用 `evidence.py run` 运行每项检查并贴出 `evidence.py report`。自己直接运行测试命令不算完成这一步。`quick` 按硬规则 4 运行一项适用检查。
-2. 审查（`feature`、`project` 进入前将 `progress.md` 状态更新为 `reviewing`）：
+1. `feature`、`project` 按 `df-verify` 技能执行验证（本会话尚未加载时再调用 Skill 工具或读取 [../df-verify/SKILL.md](../df-verify/SKILL.md)；已加载则直接沿用，不重复全文读取），`project` 或长任务进入验证前更新 `progress.md` 状态为 `verifying`，用 `evidence.py run` 运行每项检查并贴出 `evidence.py report`。自己直接运行测试命令不算完成这一步。`quick` 按硬规则 4 运行一项适用检查。
+2. 审查（需要独立审查时进入前将 `progress.md` 状态更新为 `reviewing`；无需独立审查的短 `feature` 自查通过后可直接收尾）：
    - `quick`：自查 diff。
    - `feature`：自查完整 diff 和未跟踪文件；改动超过约 300 行或涉及 5 个以上文件时，按下一条做独立审查。
    - `project`：**必须**做独立审查。候选版本稳定后尽早在新上下文中运行 `df-reviewer`（Claude Code 直接调用该子代理，Codex 用 `spawn_agent` 派发，见 [team.md](references/team.md#按运行环境派发)），传入基线提交、开工与候选版本快照、本次改动文件清单、验收条件和验证证据，**等对应审查代理成功返回报告后**再写最终报告；无法派发时按 `df-review` 逐项审查并明确标注“非独立审查（降级）”，不按“独立审查通过”计算。

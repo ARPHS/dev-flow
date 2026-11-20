@@ -784,6 +784,145 @@ class EvalCasesTest(unittest.TestCase):
         self.assertTrue(baseline["delivery_passed"])
         self.assertTrue(baseline["passed"])
 
+    def test_cross_call_ev_alias_and_multiline_evidence_scripts(self):
+        ws, base = self.workspace("ledger")
+        record_evidence(ws, "baseline", sys.executable, "-m", "unittest", "discover", "-s", "tests")
+        self._apply_feature_solution(ws)
+        record_evidence(ws, "unit", sys.executable, "-m", "unittest", "discover", "-s", "tests")
+        record_evidence(ws, "json", sys.executable, "-m", "ledger", "list", "--json")
+
+        # Claude persistent Bash session: define EV once, reuse $EV across later tool calls
+        persistent_transcript = fake_transcript(
+            ("Bash", {"command": 'EV="python /p/df-verify/scripts/evidence.py"'}),
+            ("Bash", {"command": "$EV run -l baseline -- python -m unittest discover -s tests"}),
+            ("Edit", {"file_path": "ledger/cli.py"}),
+            ("Bash", {"command": "$EV run -l unit -- python -m unittest discover -s tests"}),
+            ("Bash", {"command": "$EV run -l json -- python -m ledger list --json"}),
+            ("Bash", {"command": "$EV report"}),
+        )
+        checks = load_grader("feature")(self.context("ledger", ws, base, persistent_transcript, plugin=True))
+        self.assertEqual(required_failures(checks), [])
+
+        # Multiline evidence block (as documented in sandbox.md)
+        multiline_transcript = fake_transcript(
+            ("Bash", {"command": 'EV="python3 /p/evidence.py"\n'
+                                 '$EV run -l unit -- python3 -m unittest discover -s tests\n'
+                                 '$EV run -l json -- python3 -m ledger list --json\n'
+                                 '$EV report'}),
+        )
+        validations = {
+            "测试": lib.is_test_command,
+            "JSON 入口": lambda command: lib.invokes_python_module(command, "ledger", "list", "--json"),
+        }
+        ev_checks = lib.evidence_recorded(self.context("ledger", ws, base, multiline_transcript, plugin=True),
+                                          validations=validations)
+        self.assertTrue(all(c.ok for c in ev_checks), [c.detail for c in ev_checks])
+
+        # `evidence.py report || true` must still be rejected
+        masked_report = fake_transcript(
+            ("Bash", {"command": "python /p/evidence.py run -l unit -- python -m unittest discover -s tests"}),
+            ("Bash", {"command": "python /p/evidence.py report || true"}),
+        )
+        _, report_chk = lib.evidence_recorded(self.context("ledger", ws, base, masked_report, plugin=True))
+        self.assertFalse(report_chk.ok)
+
+    def test_shell_parsing_env_spaces_set_e_powershell_and_escaped_quotes(self):
+        # Env assignment with spaces in quoted value
+        spaced_env = 'LEDGER_FILE="/tmp/my ledger.json" python -m ledger list --json'
+        self.assertTrue(lib.invokes_python_module(spaced_env, "ledger", "list", "--json"))
+
+        # set -e preserves earlier commands across newlines, while || true is still rejected
+        set_e_script = ("set -e\n"
+                        "LEDGER_FILE=/tmp/a.json python3 -m ledger add 12.5 lunch\n"
+                        "LEDGER_FILE=/tmp/a.json python3 -m ledger list")
+        self.assertTrue(lib.invokes_python_module(set_e_script, "ledger", "add"))
+        self.assertTrue(lib.invokes_python_module(set_e_script, "ledger", "list"))
+        self.assertFalse(lib.invokes_python_module("set -e\npython -m ledger list --json || true",
+                                                   "ledger", "list", "--json"))
+
+        # PowerShell `$EV = "..." ; & $EV ...`
+        ps_cmd = '$EV = "python /p/evidence.py"; & $EV run -l unit -- python -m unittest discover -s tests'
+        self.assertTrue(lib.is_evidence_call(ps_cmd, "run"))
+        self.assertTrue(lib.is_test_command(ps_cmd))
+
+        # bash -lc with escaped inner double quotes around nested bash -c
+        nested = (r'/bin/bash -lc "python3 /p/evidence.py run -l json -- bash -c '
+                  r'\"LEDGER_FILE=/tmp/a.json python3 -m ledger list --json\""')
+        self.assertTrue(lib.is_evidence_call(nested, "run"))
+        self.assertTrue(lib.invokes_python_module(nested, "ledger", "list", "--json"))
+
+    def test_claude_background_review_task_notification_and_codex_dict_completed(self):
+        spawned = ("Agent", {"subagent_type": "dev-flow:df-reviewer", "run_in_background": True},
+                   False, "Async agent launched successfully. agentId: rev-42")
+        base_transcript = fake_transcript(spawned, include_end=False)
+
+        notif_ok = json.dumps({
+            "type": "user",
+            "message": {"content": "<task-notification><task-id>rev-42</task-id>"
+                                   "<status>completed</status><result>LGTM</result></task-notification>"},
+        })
+        notif_fail = json.dumps({
+            "type": "user",
+            "message": {"content": "<task-notification><task-id>rev-42</task-id>"
+                                   "<status>failed</status></task-notification>"},
+        })
+        notif_other = json.dumps({
+            "type": "user",
+            "message": {"content": "<task-notification><task-id>other-9</task-id>"
+                                   "<status>completed</status></task-notification>"},
+        })
+        end = json.dumps({"type": "result", "result": "done"})
+
+        ctx = Context(ws=Path(self.tmp.name), fixture=FIXTURES / "empty", base="",
+                      transcripts=["\n".join([base_transcript, notif_ok, end])])
+        self.assertEqual(required_failures(lib.independent_review(ctx)), [])
+
+        for bad_notif in (notif_fail, notif_other):
+            ctx.transcripts = ["\n".join([base_transcript, bad_notif, end])]
+            self.assertFalse(lib.independent_review(ctx)[1].ok)
+
+        # Codex wait_agent with dict payload under `completed`
+        present, is_err, completed = self.run_module._analyze_collab_output(
+            "wait_agent",
+            json.dumps({"status": {"a1": {"completed": {"final_message": "LGTM"}}}, "timed_out": False}),
+        )
+        self.assertEqual((present, is_err, completed), (True, False, ["a1"]))
+        _, err_dict, done_err = self.run_module._analyze_collab_output(
+            "wait_agent",
+            json.dumps({"status": {"a1": {"completed": {"error": "boom"}}}, "timed_out": False}),
+        )
+        self.assertTrue(err_dict)
+        self.assertEqual(done_err, [])
+
+    def test_project_cli_timeout_and_unknown_cli_exercised(self):
+        ws, base = self.workspace("empty")
+        first = self.run_module.snapshot(ws)
+        self._apply_project_solution(ws)
+        (ws / "ledger/cli.py").write_text("import time; time.sleep(5)\n", encoding="utf-8")
+        project_grade = importlib.util.spec_from_file_location("grade_project_mod", EVALS / "cases/project/grade.py")
+        mod = importlib.util.module_from_spec(project_grade)
+        project_grade.loader.exec_module(mod)
+
+        # Timeout inside CLI must produce a failed functional check rather than an uncaught exception
+        ctx = self.context("empty", ws, base, fake_transcript(), fake_transcript(),
+                           snapshots=[first, self.run_module.snapshot(ws)])
+        with mock.patch.object(ctx, "python", side_effect=subprocess.TimeoutExpired(["python", "-m", "ledger"], 20)):
+            chk = mod.project_cli_behavior(ctx)
+        self.assertFalse(chk.ok)
+        self.assertEqual(chk.category, "functional")
+        self.assertIn("超时", chk.detail)
+
+        # Unfinished CLI tool call in transcript must be marked status="unknown"
+        use = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "cli-call", "name": "Bash",
+             "input": {"command": "python -m ledger list"}}]}}
+        unfinished = "\n".join(map(json.dumps, [use, {"type": "result", "result": "done"}]))
+        ctx2 = self.context("empty", ws, base, fake_transcript(), unfinished,
+                            snapshots=[first, self.run_module.snapshot(ws)])
+        exercised = mod.real_cli_exercised(ctx2, turn=1)
+        self.assertFalse(exercised.ok)
+        self.assertEqual(exercised.status, "unknown")
+
 
 class RunTurnTests(unittest.TestCase):
     """The runner must not hang on CLIs whose children outlive the turn."""

@@ -1,5 +1,6 @@
 import re
 import secrets
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -37,12 +38,17 @@ def project_cli_behavior(ctx):
     with tempfile.TemporaryDirectory() as temporary:
         data_file = Path(temporary) / "ledger.data"
         env = {"LEDGER_FILE": str(data_file)}
-        added = ctx.python("-m", "ledger", "add", "12.5", notes[0], env=env, timeout=20)
-        first = ctx.python("-m", "ledger", "list", env=env, timeout=20)
-        appended = ctx.python("-m", "ledger", "add", "3.25", notes[1], env=env, timeout=20)
-        second = ctx.python("-m", "ledger", "list", env=env, timeout=20)
-        separate = ctx.python("-m", "ledger", "list",
-                              env={"LEDGER_FILE": str(Path(temporary) / "other.data")}, timeout=20)
+        try:
+            added = ctx.python("-m", "ledger", "add", "12.5", notes[0], env=env, timeout=20)
+            first = ctx.python("-m", "ledger", "list", env=env, timeout=20)
+            appended = ctx.python("-m", "ledger", "add", "3.25", notes[1], env=env, timeout=20)
+            second = ctx.python("-m", "ledger", "list", env=env, timeout=20)
+            separate = ctx.python("-m", "ledger", "list",
+                                  env={"LEDGER_FILE": str(Path(temporary) / "other.data")}, timeout=20)
+        except subprocess.TimeoutExpired as exc:
+            cmd = " ".join(map(str, exc.cmd)) if isinstance(exc.cmd, (list, tuple)) else str(exc.cmd)
+            return Check("录入、列出及跨进程持久化正确", False,
+                         f"CLI 超时（{exc.timeout}s）：{cmd[:120]}", category="functional")
         commands = [added, first, appended, second, separate]
         ok = (all(command.returncode == 0 for command in commands) and data_file.is_file()
               and notes[0] in first.stdout and notes[1] not in first.stdout
@@ -56,13 +62,15 @@ def project_cli_behavior(ctx):
 
 def real_cli_exercised(ctx, turn=1):
     """Check that the agent actually invoked the generated project's CLI entrypoint with exit code 0."""
-    hits = []
-    for exe in ctx.shell_executions(turn):
-        cmd = exe["command"]
-        if execution_succeeded(exe) and any(invokes_python_module(cmd, "ledger", sub) for sub in ("add", "list")):
-            hits.append(cmd)
-    return Check("真实运行了 CLI 入口验证", bool(hits), hits[0][:120] if hits else "未发现通过的项目 CLI 入口调用",
-                 required=True, category="functional")
+    hits = [exe for exe in ctx.shell_executions(turn)
+            if any(invokes_python_module(argv, "ledger", sub)
+                   for argv in exe["argvs"] for sub in ("add", "list"))]
+    passing = [exe for exe in hits if execution_succeeded(exe)]
+    unknown = bool(hits) and not passing and any(
+        exe["exit_code"] is None or not exe["output_present"] for exe in hits)
+    return Check("真实运行了 CLI 入口验证", bool(passing),
+                 passing[0]["command"][:120] if passing else "未发现通过的项目 CLI 入口调用",
+                 required=True, category="functional", status="unknown" if unknown else "")
 
 
 def grade(ctx):

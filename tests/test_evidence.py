@@ -415,6 +415,32 @@ class EvidenceTest(unittest.TestCase):
         records = evidence.load_records(self.repo)
         self.assertEqual(records[-1]["cwd"], "pkg/sub")
 
+    def test_doctor_flags_missing_state_gitignore(self):
+        (self.repo / ".dev-flow/.gitignore").unlink()
+        proc = cli(self.repo, "doctor", "--json")
+        self.assertEqual(proc.returncode, 1)
+        info = json.loads(proc.stdout)
+        self.assertFalse(info["ok"])
+        state_check = next(c for c in info["checks"] if c["name"] == "state_dir")
+        self.assertFalse(state_check["ok"])
+        self.assertTrue(any(".gitignore" in tip for tip in info["tips"]))
+
+    def test_summarize_output_caps_wide_lines_and_prunes_old_logs(self):
+        wide = ("X" * 20000 + "\n") + "\n".join(f"line-{i}" for i in range(80)) + "\n"
+        summary = evidence.summarize_output(wide, 0, log_rel=".dev-flow/logs/wide.log")
+        self.assertLess(len(summary), evidence.MAX_STDOUT_CHARS)
+        self.assertIn(".dev-flow/logs/wide.log", summary)
+
+        logs_dir = self.repo / ".dev-flow/logs"
+        logs_dir.mkdir(exist_ok=True)
+        older = logs_dir / "20260101-000000-old-aaa111.log"
+        older.write_text("a" * 500, encoding="utf-8")
+        os.utime(older, (1000, 1000))
+        with mock.patch.object(evidence, "LOGS_CAP", 600):
+            newest_rel = evidence.save_log(self.repo, "new", "b" * 400)
+        self.assertFalse(older.exists())
+        self.assertTrue((self.repo / newest_rel).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

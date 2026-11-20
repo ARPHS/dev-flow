@@ -11,7 +11,6 @@ Checks are grouped into dimensions:
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -76,60 +75,205 @@ def python_args(argv):
     return args
 
 
-def command_argvs(command):
-    """Recognize direct commands, shell wrappers and evidence wrappers; retain only a successful final chain."""
-    aliases = {}
+def _tokenize_shell(text):
+    """Tokenize a shell command into (token, is_operator) pairs while preserving quotes, escapes and Windows paths."""
+    tokens = []
+    buf = []
+    has_token = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r":
+            if has_token:
+                tokens.append(("".join(buf), False))
+                buf, has_token = [], False
+            i += 1
+        elif ch == "\n":
+            if has_token:
+                tokens.append(("".join(buf), False))
+                buf, has_token = [], False
+            tokens.append(("\n", True))
+            i += 1
+        elif ch == "\\" and i + 1 < n and text[i + 1] == "\n":
+            i += 2
+        elif ch in ";&|<>":
+            if has_token:
+                tokens.append(("".join(buf), False))
+                buf, has_token = [], False
+            if text[i:i + 3] == "<<-":
+                tokens.append(("<<-", True))
+                i += 3
+            elif text[i:i + 2] in ("&&", "||", "<<", ">>", ">&", "<&"):
+                tokens.append((text[i:i + 2], True))
+                i += 2
+            else:
+                tokens.append((ch, True))
+                i += 1
+        elif ch == "'":
+            has_token = True
+            i += 1
+            while i < n and text[i] != "'":
+                buf.append(text[i])
+                i += 1
+            if i >= n:
+                return None
+            i += 1
+        elif ch == '"':
+            has_token = True
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n and text[i + 1] in ('"', "\\"):
+                    buf.append(text[i + 1])
+                    i += 2
+                else:
+                    buf.append(text[i])
+                    i += 1
+            if i >= n:
+                return None
+            i += 1
+        else:
+            has_token = True
+            buf.append(ch)
+            i += 1
+    if has_token:
+        tokens.append(("".join(buf), False))
+    return tokens
+
+
+def _is_env_assignment(token):
+    return bool(re.match(r"^[A-Za-z_]\w*=", token))
+
+
+def _is_set_errexit(argv):
+    if not argv or argv[0] != "set":
+        return None
+    result = None
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "-o" and i + 1 < len(argv):
+            if argv[i + 1] == "errexit":
+                result = True
+            i += 2
+            continue
+        if arg == "+o" and i + 1 < len(argv):
+            if argv[i + 1] == "errexit":
+                result = False
+            i += 2
+            continue
+        if len(arg) > 1 and arg[0] in ("-", "+") and arg[1:].isalpha():
+            if "e" in arg[1:]:
+                result = arg[0] == "-"
+        i += 1
+    return result
+
+
+def _record_assignments(argv, active_aliases, out_aliases=None):
+    """Record shell variable assignments (Bash `VAR=...` / `export VAR=...`, PowerShell `$VAR = ...`)."""
+    if not argv:
+        return False
+    # PowerShell: $VAR = "value"
+    if len(argv) >= 3 and re.fullmatch(r"\$([A-Za-z_]\w*)", argv[0]) and argv[1] == "=":
+        name = argv[0][1:]
+        value = " ".join(argv[2:])
+        active_aliases[name] = value
+        if out_aliases is not None:
+            out_aliases[name] = value
+        return True
+    # Bash / PowerShell inline: VAR=value, $VAR=value, export VAR=value
+    items = argv[1:] if argv[0] == "export" and len(argv) > 1 else argv
+    if items and all(re.match(r"^\$?[A-Za-z_]\w*=", item) for item in items):
+        for item in items:
+            name, value = item.lstrip("$").split("=", 1)
+            active_aliases[name] = value
+            if out_aliases is not None:
+                out_aliases[name] = value
+        return True
+    return False
+
+
+def command_argvs(command, aliases=None, strict_chain=True, errexit=False, out_aliases=None):
+    """Recognize direct commands, shell wrappers and evidence wrappers; retain only a guaranteed-exit chain."""
+    active_aliases = dict(aliases or {})
     if isinstance(command, list):
-        groups = [command]
+        groups = [(command, dict(active_aliases))]
     elif isinstance(command, str):
-        aliases = {name: value for name, _, value in re.findall(r"\b([A-Za-z_]\w*)=(['\"])(.*?)\2", command)}
-        lexer = shlex.shlex(command.strip(), posix=False, punctuation_chars=";&|<>\n")
-        lexer.whitespace = " \t\r"
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        try:
-            words = list(lexer)
-        except ValueError:
+        tokens = _tokenize_shell(command.strip())
+        if tokens is None:
             return []
-        if "<<" in words or "<<-" in words:
+        if any(is_op and tok in ("<<", "<<-") for tok, is_op in tokens):
             return []
         groups, current = [], []
-        for word in words:
-            if word in ("&&", ";", "||", "|", "\n", "&"):
+        keep_on_seq = errexit or not strict_chain
+        for tok, is_op in tokens:
+            if is_op and tok in ("&&", ";", "||", "|", "\n", "&"):
+                if tok == "&" and not current:
+                    continue  # PowerShell call operator `& $EV ...`
                 if current:
-                    groups.append(current)
-                if word != "&&":
+                    if not _record_assignments(current, active_aliases, out_aliases=out_aliases):
+                        toggled = _is_set_errexit(current)
+                        if toggled is not None:
+                            errexit = toggled
+                            keep_on_seq = errexit or not strict_chain
+                        groups.append((current, dict(active_aliases)))
+                if tok in ("||", "|", "&") or (tok in (";", "\n") and not keep_on_seq):
                     groups = []
                 current = []
             else:
-                current.append(word[1:-1] if len(word) > 1 and word[0] == word[-1] and word[0] in "'\"" else word)
+                current.append(tok)
         if current:
-            groups.append(current)
+            if not _record_assignments(current, active_aliases, out_aliases=out_aliases):
+                groups.append((current, dict(active_aliases)))
     else:
         return []
 
     result = []
-    for argv in groups:
-        while argv and ("=" in argv[0] or argv[0] == "env"):
-            argv = argv[1:]
+    for argv, cmd_aliases in groups:
+        while argv:
+            if _is_env_assignment(argv[0]):
+                argv = argv[1:]
+            elif argv[0] == "env":
+                argv = argv[1:]
+                while argv and argv[0].startswith("-"):
+                    if argv[0] in ("-u", "--unset", "-C", "--chdir") and len(argv) > 1:
+                        argv = argv[2:]
+                    elif argv[0] == "--":
+                        argv = argv[1:]
+                        break
+                    else:
+                        argv = argv[1:]
+            else:
+                break
         if not argv:
             continue
-        alias = aliases.get(argv[0].strip("${}")) if argv[0].startswith("$") else None
-        if alias:
-            prefixes = command_argvs(alias)
+        alias_match = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?", argv[0])
+        if alias_match and alias_match.group(1) in cmd_aliases:
+            alias_name = alias_match.group(1)
+            nested_aliases = {k: v for k, v in cmd_aliases.items() if k != alias_name}
+            prefixes = command_argvs(cmd_aliases[alias_name], aliases=nested_aliases, strict_chain=strict_chain)
             if len(prefixes) == 1:
                 argv = [*prefixes[0], *argv[1:]]
         name = program_name(argv[0])
-        if name in ("bash", "sh", "pwsh", "pwsh.exe", "powershell", "powershell.exe", "cmd", "cmd.exe"):
-            flag = next((index for index, arg in enumerate(argv)
-                         if arg.lower() in ("-c", "-lc", "-command", "/c")), None)
+        if name in ("bash", "sh"):
+            flag = next((index for index, arg in enumerate(argv[1:], start=1)
+                         if re.fullmatch(r"-[a-zA-Z]*c", arg)), None)
             if flag is not None and flag + 1 < len(argv):
-                result.extend(command_argvs(" ".join(argv[flag + 1:])))
+                sub_errexit = any(re.fullmatch(r"-[a-zA-Z]*e[a-zA-Z]*", arg) for arg in argv[1:flag + 1])
+                result.extend(command_argvs(argv[flag + 1], aliases=cmd_aliases,
+                                            strict_chain=strict_chain, errexit=sub_errexit))
+            continue
+        if name in ("pwsh", "pwsh.exe", "powershell", "powershell.exe", "cmd", "cmd.exe"):
+            flag = next((index for index, arg in enumerate(argv[1:], start=1)
+                         if arg.lower() in ("-c", "-command", "/c")), None)
+            if flag is not None and flag + 1 < len(argv):
+                result.extend(command_argvs(" ".join(argv[flag + 1:]), aliases=cmd_aliases,
+                                            strict_chain=strict_chain))
             continue
         result.append(argv)
         args = python_args(argv)
         if args and program_name(args[0]) == "evidence.py" and args[1:2] == ["run"] and "--" in args:
-            result.extend(command_argvs(args[args.index("--") + 1:]))
+            result.extend(command_argvs(args[args.index("--") + 1:], aliases=cmd_aliases,
+                                        strict_chain=strict_chain))
     return result
 
 
@@ -173,7 +317,10 @@ def background_agent_id(output):
     if isinstance(parsed, dict):
         return parsed.get("agent_id") or parsed.get("task_id") or parsed.get("agentId")
     match = re.search(r"(?:agentId|agent_id|task_id)\s*[:=]\s*([\w-]+)", output)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    xml_match = re.search(r"<task-id>\s*([^<\s]+)\s*</task-id>", output)
+    return xml_match.group(1) if xml_match else None
 
 
 def task_completed(output):
@@ -263,11 +410,43 @@ class Context:
                     yield from codex_tool_uses(event.get("item") or {})
 
     def shell_executions(self, turn=None):
-        """Shell commands paired with outcome (`exit_code` / `is_error`) and tool index."""
-        return [{"command": data.get("command", ""), "exit_code": data.get("exit_code"),
-                 "is_error": data.get("output_error"), "output_present": data.get("output_present", False),
-                 "output": data.get("output", ""), "tool_index": index}
-                for index, (name, data) in enumerate(self.tool_uses(turn)) if name in ("Bash", "PowerShell")]
+        """Shell commands paired with outcome (`exit_code` / `is_error`), parsed argvs, and tool index."""
+        turns = range(len(self.transcripts)) if turn is None else [turn]
+        executions = []
+        tool_index = 0
+        for turn_idx in turns:
+            turn_aliases = {}
+            for name, data in self.tool_uses(turn_idx):
+                if name in ("Bash", "PowerShell"):
+                    command = data.get("command", "")
+                    prior_aliases = dict(turn_aliases)
+                    argvs = command_argvs(command, aliases=prior_aliases, out_aliases=turn_aliases)
+                    all_argvs = command_argvs(command, aliases=prior_aliases, strict_chain=False)
+                    executions.append({
+                        "command": command,
+                        "argvs": argvs,
+                        "all_argvs": all_argvs,
+                        "exit_code": data.get("exit_code"),
+                        "is_error": data.get("output_error"),
+                        "output_present": data.get("output_present", False),
+                        "output": data.get("output", ""),
+                        "tool_index": tool_index,
+                    })
+                tool_index += 1
+        return executions
+
+    def completed_task_notifications(self, turn=None):
+        """Task IDs reported completed via Claude Code <task-notification> user messages."""
+        completed = set()
+        for event in self.events(turn):
+            if event.get("type") != "user":
+                continue
+            text = output_text((event.get("message") or {}).get("content"))
+            for block in re.findall(r"<task-notification>(.*?)</task-notification>", text, re.DOTALL):
+                match = re.search(r"<task-id>\s*([^<\s]+)\s*</task-id>", block)
+                if match and "<status>completed</status>" in block:
+                    completed.add(match.group(1))
+        return completed
 
     def bash_commands(self, turn=None):
         return [i.get("command", "") for n, i in self.tool_uses(turn) if n in ("Bash", "PowerShell")]
@@ -534,7 +713,8 @@ def tests_added(ctx, rel_dir="tests"):
 
 
 def ran_tests(ctx, turn=None):
-    hits = [execution for execution in ctx.shell_executions(turn) if is_test_command(execution["command"])]
+    hits = [execution for execution in ctx.shell_executions(turn)
+            if any(is_test_command(argv) for argv in execution["argvs"])]
     if not hits:
         return Check("实际运行了测试命令且最终通过", False, "未发现测试命令", category="functional")
     last = hits[-1]
@@ -569,8 +749,10 @@ def evidence_recorded(ctx, turn=None, required=None, validations=None):
     req = ctx.plugin if required is None else required
     validations = validations or {"测试": is_test_command}
     executions = ctx.shell_executions(turn)
-    runs = [execution for execution in executions if is_evidence_call(execution["command"], "run")]
-    reports = [execution for execution in executions if is_evidence_call(execution["command"], "report")]
+    runs = [execution for execution in executions
+            if any(is_evidence_call(argv, "run") for argv in execution["all_argvs"])]
+    reports = [execution for execution in executions
+               if any(is_evidence_call(argv, "report") for argv in execution["all_argvs"])]
     data = ctx.evidence_report()
     records = data.get("records", []) if data else []
     passing = [record for record in records if record.get("exit") == 0 and record.get("label") != "baseline"]
@@ -580,7 +762,8 @@ def evidence_recorded(ctx, turn=None, required=None, validations=None):
     missing_current = [name for name, matches in validations.items()
                        if not any(matches(record.get("argv") or record.get("cmd", "")) for record in current)]
     missing_calls = [name for name, matches in validations.items()
-                     if not any(execution_succeeded(execution) and matches(execution["command"]) for execution in runs)]
+                     if not any(execution_succeeded(execution)
+                                and any(matches(argv) for argv in execution["all_argvs"]) for execution in runs)]
     run_ok = not missing_calls and not missing_runs
     report_ok = any(execution_succeeded(execution) for execution in reports) and not missing_calls and not missing_current
     run_detail = f"{len(runs)} 次，落盘 {len(records)} 条"
@@ -623,9 +806,11 @@ def independent_review(ctx, turn=None, required=None):
     background_ids = {str(agent_id) for name, data in started if name in ("Agent", "Task") and data.get("run_in_background")
                       for agent_id in [background_agent_id(data.get("output", ""))] if agent_id}
     polled = [data for name, data in uses if name == "TaskOutput" and str(data.get("task_id")) in background_ids]
-    completed = completed or any(data.get("output_present") is True and data.get("output_error") is False
-                                 and task_completed(data.get("output", "")) for data in polled)
-    wait_unknown = (unknown or bool(background_ids and not polled)
+    notified = background_ids.intersection(ctx.completed_task_notifications(turn))
+    completed = completed or bool(notified) or any(
+        data.get("output_present") is True and data.get("output_error") is False
+        and task_completed(data.get("output", "")) for data in polled)
+    wait_unknown = (unknown or bool(background_ids and not polled and not notified)
                     or any(not data.get("output_present") or not isinstance(data.get("completed_agents"), list) for data in waits))
     returned = Check("等待了审查结果并返回", completed, "对应审查代理已完成" if completed else "缺少对应审查代理的成功完成结果",
                      required=req, category="compliance", status="unknown" if wait_unknown and not completed else "")
