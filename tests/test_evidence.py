@@ -415,7 +415,7 @@ class EvidenceTest(unittest.TestCase):
         records = evidence.load_records(self.repo)
         self.assertEqual(records[-1]["cwd"], "pkg/sub")
 
-    def test_doctor_flags_missing_state_gitignore(self):
+    def test_doctor_flags_missing_state_gitignore_and_allows_shared_ledger(self):
         (self.repo / ".dev-flow/.gitignore").unlink()
         proc = cli(self.repo, "doctor", "--json")
         self.assertEqual(proc.returncode, 1)
@@ -423,23 +423,75 @@ class EvidenceTest(unittest.TestCase):
         self.assertFalse(info["ok"])
         state_check = next(c for c in info["checks"] if c["name"] == "state_dir")
         self.assertFalse(state_check["ok"])
+        self.assertEqual(set(info["state"]["unignored"]), {"objects/", "evidence.jsonl", "logs/", "index-*"})
         self.assertTrue(any(".gitignore" in tip for tip in info["tips"]))
 
-    def test_summarize_output_caps_wide_lines_and_prunes_old_logs(self):
+        # Shared-ledger ignore config documented in state.md must pass doctor
+        (self.repo / ".dev-flow/.gitignore").write_text(
+            "objects/\nevidence.jsonl\nlogs/\nindex-*\n", encoding="utf-8",
+        )
+        shared_proc = cli(self.repo, "doctor", "--json")
+        self.assertEqual(shared_proc.returncode, 0, shared_proc.stdout + shared_proc.stderr)
+        shared_info = json.loads(shared_proc.stdout)
+        self.assertTrue(shared_info["ok"])
+        self.assertTrue(shared_info["state"]["gitignore_ok"])
+        self.assertEqual(shared_info["state"]["unignored"], [])
+
+        # Missing `logs/` in shared-ledger rules must be flagged specifically
+        (self.repo / ".dev-flow/.gitignore").write_text("objects/\nevidence.jsonl\nindex-*\n", encoding="utf-8")
+        partial_proc = cli(self.repo, "doctor", "--json")
+        self.assertEqual(partial_proc.returncode, 1)
+        partial_info = json.loads(partial_proc.stdout)
+        self.assertEqual(partial_info["state"]["unignored"], ["logs/"])
+
+        # Repo-level .gitignore ignoring .dev-flow/ also satisfies Git ignore behavior
+        (self.repo / ".dev-flow/.gitignore").unlink()
+        (self.repo / ".gitignore").write_text("ignored/\n.dev-flow/\n", encoding="utf-8")
+        root_gi = cli(self.repo, "doctor", "--json")
+        self.assertEqual(root_gi.returncode, 0, root_gi.stdout + root_gi.stderr)
+        self.assertTrue(json.loads(root_gi.stdout)["ok"])
+
+    def test_summarize_output_caps_wide_lines_and_prunes_superseded_logs_first(self):
         wide = ("X" * 20000 + "\n") + "\n".join(f"line-{i}" for i in range(80)) + "\n"
         summary = evidence.summarize_output(wide, 0, log_rel=".dev-flow/logs/wide.log")
         self.assertLess(len(summary), evidence.MAX_STDOUT_CHARS)
         self.assertIn(".dev-flow/logs/wide.log", summary)
 
-        logs_dir = self.repo / ".dev-flow/logs"
-        logs_dir.mkdir(exist_ok=True)
-        older = logs_dir / "20260101-000000-old-aaa111.log"
-        older.write_text("a" * 500, encoding="utf-8")
-        os.utime(older, (1000, 1000))
-        with mock.patch.object(evidence, "LOGS_CAP", 600):
-            newest_rel = evidence.save_log(self.repo, "new", "b" * 400)
-        self.assertFalse(older.exists())
-        self.assertTrue((self.repo / newest_rel).is_file())
+        # Two-tier pruning: superseded logs are dropped before logs referenced by latest records
+        big_code = "print('x' * 13000)"
+        code1, _, rec1, _ = evidence.run([sys.executable, "-c", big_code], label="AC1", cwd=self.repo)
+        self.assertEqual(code1, 0)
+        code2, _, rec2, _ = evidence.run([sys.executable, "-c", big_code], label="AC2", cwd=self.repo)
+        self.assertEqual(code2, 0)
+        # Re-run AC2 so rec2's log becomes superseded, and make AC1 older than rec2 to verify tier priority
+        os.utime(self.repo / rec1["log"], (1000, 1000))
+        os.utime(self.repo / rec2["log"], (2000, 2000))
+        ac1_size = (self.repo / rec1["log"]).stat().st_size
+        with mock.patch.object(evidence, "LOGS_CAP", ac1_size * 2 + 500):
+            code3, _, rec3, notes3 = evidence.run([sys.executable, "-c", big_code], label="AC2", cwd=self.repo)
+        self.assertEqual(code3, 0)
+        self.assertTrue((self.repo / rec1["log"]).is_file(), "active latest log should survive while superseded log is dropped")
+        self.assertFalse((self.repo / rec2["log"]).exists(), "superseded log should be pruned first")
+        self.assertTrue((self.repo / rec3["log"]).is_file())
+        self.assertFalse(any("完整日志" in n for n in notes3), notes3)
+
+        # When cap forces pruning an active latest log, note it and mark report entry as pruned (no dangling path)
+        with mock.patch.object(evidence, "LOGS_CAP", ac1_size + 500):
+            code4, _, rec4, notes4 = evidence.run([sys.executable, "-c", big_code], label="AC3", cwd=self.repo)
+        self.assertEqual(code4, 0)
+        self.assertFalse((self.repo / rec1["log"]).exists())
+        self.assertTrue((self.repo / rec4["log"]).is_file())
+        self.assertTrue(any("已清理" in n and "完整日志" in n for n in notes4), notes4)
+
+        data = evidence.report_data(self.repo)
+        by_label = {r["label"]: r for r in data["records"]}
+        self.assertIsNone(by_label["AC1"]["log"])
+        self.assertEqual(by_label["AC1"]["log_status"], "pruned")
+        self.assertEqual(by_label["AC3"]["log_status"], "present")
+        self.assertEqual(by_label["AC3"]["log"], rec4["log"])
+        md, ok = evidence.report(self.repo)
+        self.assertTrue(ok)
+        self.assertIn("完整日志已清理", md)
 
 
 if __name__ == "__main__":

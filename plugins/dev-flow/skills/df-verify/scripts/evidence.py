@@ -249,33 +249,53 @@ def summarize_output(output, exit_code, log_rel=None):
             f"{output[-keep_tail:]}\n")
 
 
-def prune_logs(logs_dir, keep_path):
-    """Drop oldest .log files when .dev-flow/logs exceeds LOGS_CAP (never removing keep_path)."""
-    files = sorted((p for p in logs_dir.glob("*.log") if p.is_file()),
-                   key=lambda p: p.stat().st_mtime)
+def prune_logs(root, logs_dir, keep_path, replacing_key=None):
+    """Prune .log files past LOGS_CAP: drop superseded/unreferenced logs first, active latest logs only if needed."""
+    active_logs = set()
+    for rec in latest_records(load_records(root)):
+        key = (rec.get("label"), rec.get("cwd"), rec.get("cmd"))
+        if replacing_key is not None and key == replacing_key:
+            continue
+        log_rel = rec.get("log")
+        if log_rel:
+            active_logs.add((root / log_rel).resolve())
+
+    files = [p for p in logs_dir.glob("*.log") if p.is_file()]
     total = sum(p.stat().st_size for p in files)
-    for old in files:
-        if total <= LOGS_CAP:
-            break
-        if old == keep_path:
-            continue
-        try:
-            size = old.stat().st_size
-            old.unlink()
-            total -= size
-        except OSError:
-            continue
+    if total <= LOGS_CAP:
+        return 0
+
+    keep_resolved = keep_path.resolve()
+    unreferenced = sorted((p for p in files if p.resolve() != keep_resolved and p.resolve() not in active_logs),
+                          key=lambda p: p.stat().st_mtime)
+    referenced = sorted((p for p in files if p.resolve() != keep_resolved and p.resolve() in active_logs),
+                        key=lambda p: p.stat().st_mtime)
+
+    pruned_active = 0
+    for is_active, bucket in ((False, unreferenced), (True, referenced)):
+        for old in bucket:
+            if total <= LOGS_CAP:
+                return pruned_active
+            try:
+                size = old.stat().st_size
+                old.unlink()
+                total -= size
+                if is_active:
+                    pruned_active += 1
+            except OSError:
+                continue
+    return pruned_active
 
 
-def save_log(root, label, output):
+def save_log(root, label, output, replacing_key=None):
     logs_dir = root / STATE / "logs"
     logs_dir.mkdir(exist_ok=True)
     safe_label = re.sub(r"[^a-zA-Z0-9._-]+", "_", label or "run").strip("_") or "run"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = logs_dir / f"{stamp}-{safe_label}-{secrets.token_hex(3)}.log"
     log_path.write_text(output, encoding="utf-8")
-    prune_logs(logs_dir, log_path)
-    return log_path.relative_to(root).as_posix()
+    pruned_active = prune_logs(root, logs_dir, log_path, replacing_key=replacing_key)
+    return log_path.relative_to(root).as_posix(), pruned_active
 
 
 def run(argv, label=None, cwd="."):
@@ -310,10 +330,14 @@ def run(argv, label=None, cwd="."):
         tree, large = snapshot(root, object_store(root))  # after the run: covers files it changed
     except GitError as exc:
         return proc.returncode, output, None, [f"快照失败，未记录：{exc}"]
+    cwd_rel = relative_cwd(cwd, root)
     log_rel = None
     if len(output) > MAX_STDOUT_CHARS:
         try:
-            log_rel = save_log(root, label, output)
+            log_rel, pruned_active = save_log(root, label, output,
+                                              replacing_key=(label or "", cwd_rel, command))
+            if pruned_active:
+                notes.append(f"日志目录超过上限，已清理 {pruned_active} 份较早记录的完整日志")
         except OSError as exc:
             notes.append(f"完整日志保存失败：{exc}")
     record = {
@@ -321,7 +345,7 @@ def run(argv, label=None, cwd="."):
         "label": label or "",
         "cmd": command,
         "argv": list(argv),
-        "cwd": relative_cwd(cwd, root),
+        "cwd": cwd_rel,
         "exit": proc.returncode,
         "duration_s": duration,
         "snapshot": tree,
@@ -362,6 +386,8 @@ def report_data(cwd="."):
         old = r.get("snapshot", "")
         changes = [] if old == now else changes_between(root, store, old, now) if old else None
         last = (r.get("tail") or "").splitlines()[-1:] or [""]
+        raw_log = r.get("log")
+        log_exists = bool(raw_log) and (root / raw_log).is_file()
         entries.append({
             "index": index,
             "time": r.get("time", ""),
@@ -377,7 +403,8 @@ def report_data(cwd="."):
             "changes": changes,
             "tail": r.get("tail", ""),
             "summary": last[0][:80],
-            "log": r.get("log"),
+            "log": raw_log if log_exists else None,
+            "log_status": ("present" if log_exists else "pruned") if raw_log else None,
         })
     return {
         "snapshot": now,
@@ -400,6 +427,9 @@ def report(cwd="."):
         lines.append("| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |")
     if data["large_files"]:
         lines.append("\n未纳入对比的大文件（建议加入 .gitignore）：" + ", ".join(data["large_files"][:5]))
+    pruned = [r for r in data["records"] if r.get("log_status") == "pruned"]
+    if pruned:
+        lines.append(f"\n完整日志已清理：{len(pruned)} 条记录仅保留上方摘要，需要完整输出时请重跑对应命令。")
     return "\n".join(lines), True
 
 
@@ -418,6 +448,30 @@ def snapshot_diff(before, after, cwd="."):
 
 
 # ---- doctor ----
+
+STATE_IGNORE_PROBES = (
+    (f"{STATE}/objects/probe", "objects/"),
+    (f"{STATE}/evidence.jsonl", "evidence.jsonl"),
+    (f"{STATE}/logs/probe.log", "logs/"),
+    (f"{STATE}/index-probe", "index-*"),
+)
+
+
+def state_ignore_status(root):
+    """Check via `git check-ignore` whether all runtime artifacts inside .dev-flow/ are ignored.
+
+    Compatible with both default `.dev-flow/.gitignore` (`*`), shared-ledger ignore rules
+    (`objects/`, `evidence.jsonl`, `logs/`, `index-*`), and repository-level `.gitignore`.
+    """
+    probes = [path for path, _ in STATE_IGNORE_PROBES]
+    proc = subprocess.run(["git", "check-ignore", "-z", "--stdin"], cwd=root,
+                          input=b"\0".join(p.encode("utf-8") for p in probes), capture_output=True)
+    if proc.returncode not in (0, 1):
+        return False, [label for _, label in STATE_IGNORE_PROBES]
+    ignored = {decode(entry) for entry in proc.stdout.split(b"\0") if entry}
+    missing = [label for path, label in STATE_IGNORE_PROBES if path not in ignored]
+    return not missing, missing
+
 
 def parse_git_version(text):
     match = re.search(r"(\d+)\.(\d+)", text or "")
@@ -473,18 +527,20 @@ def doctor(cwd="."):
             repo_detail = git_hint(exc) or str(exc)
     checks.append({"name": "git_repo", "ok": repo_ok, "detail": repo_detail})
 
-    state_info = {"present": False, "gitignore_ok": False, "project_md": False, "evidence_count": 0}
+    state_info = {"present": False, "gitignore_ok": False, "unignored": [], "project_md": False, "evidence_count": 0}
     state_ok = True
     if root is not None:
         state_dir = root / STATE
         if state_dir.is_dir():
             state_info["present"] = True
-            gi = state_dir / ".gitignore"
-            state_info["gitignore_ok"] = gi.is_file() and "*" in gi.read_text(encoding="utf-8", errors="replace").splitlines()
+            ignore_ok, unignored = state_ignore_status(root)
+            state_info["gitignore_ok"] = ignore_ok
+            state_info["unignored"] = unignored
             state_info["project_md"] = (state_dir / "project.md").is_file()
             state_info["evidence_count"] = len(load_records(root))
-            state_ok = state_info["gitignore_ok"]
-            state_detail = (f"已存在（.gitignore={'OK' if state_info['gitignore_ok'] else '缺失'}, "
+            state_ok = ignore_ok
+            ignore_desc = "OK" if ignore_ok else f"未忽略 {', '.join(unignored)}"
+            state_detail = (f"已存在（忽略规则={ignore_desc}, "
                             f"project.md={'有' if state_info['project_md'] else '无'}, "
                             f"证据记录={state_info['evidence_count']}）")
         else:
@@ -493,7 +549,8 @@ def doctor(cwd="."):
 
     tips = []
     if state_info["present"] and not state_info["gitignore_ok"]:
-        tips.append(f"请创建包含 `*` 的 {STATE}/.gitignore，避免台账、日志和快照文件出现在 git status 中")
+        tips.append(f"请在 {STATE}/.gitignore 写入 `*`（共享台账模式可只忽略 objects/、evidence.jsonl、logs/ 和 index-*），"
+                    "避免运行产物出现在 git status 中")
     if os.name == "nt" and os.environ.get("PYTHONUTF8") != "1":
         tips.append("Windows 环境建议设置 PYTHONUTF8=1，避免中文输出或文件读写出现 GBK 编码问题")
     if os.name != "nt":

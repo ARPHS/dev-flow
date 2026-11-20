@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -75,6 +76,12 @@ def python_args(argv):
     return args
 
 
+CONTROL_OPEN = {"if", "while", "until", "for", "case", "{"}
+CONTROL_CLOSE = {"fi", "done", "esac", "}"}
+CONTROL_MID = {"then", "elif", "else", "do", "in", "!"}
+EXIT_WORDS = {"exit", "return"}
+
+
 def _tokenize_shell(text):
     """Tokenize a shell command into (token, is_operator) pairs while preserving quotes, escapes and Windows paths."""
     tokens = []
@@ -96,7 +103,7 @@ def _tokenize_shell(text):
             i += 1
         elif ch == "\\" and i + 1 < n and text[i + 1] == "\n":
             i += 2
-        elif ch in ";&|<>":
+        elif ch in ";&|<>()":
             if has_token:
                 tokens.append(("".join(buf), False))
                 buf, has_token = [], False
@@ -192,89 +199,220 @@ def _record_assignments(argv, active_aliases, out_aliases=None):
     return False
 
 
-def command_argvs(command, aliases=None, strict_chain=True, errexit=False, out_aliases=None):
-    """Recognize direct commands, shell wrappers and evidence wrappers; retain only a guaranteed-exit chain."""
+def _strip_env_prefix(argv):
+    while argv:
+        if _is_env_assignment(argv[0]):
+            argv = argv[1:]
+        elif argv[0] == "env":
+            argv = argv[1:]
+            while argv and argv[0].startswith("-"):
+                if argv[0] in ("-u", "--unset", "-C", "--chdir") and len(argv) > 1:
+                    argv = argv[2:]
+                elif argv[0] == "--":
+                    argv = argv[1:]
+                    break
+                else:
+                    argv = argv[1:]
+        else:
+            break
+    return argv
+
+
+def _expand_command_group(argv, cmd_aliases, allow_errexit=True):
+    """Expand one command group into (guaranteed_argvs, guaranteed_ev_runs, cand_argvs, cand_ev_runs)."""
+    argv = _strip_env_prefix(argv)
+    if not argv:
+        return [], [], [], []
+    alias_match = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?", argv[0])
+    if alias_match and alias_match.group(1) in cmd_aliases:
+        alias_name = alias_match.group(1)
+        nested_aliases = {k: v for k, v in cmd_aliases.items() if k != alias_name}
+        prefixes, _, _, _ = _parse_shell_command(cmd_aliases[alias_name], aliases=nested_aliases,
+                                                 allow_errexit=allow_errexit)
+        if len(prefixes) == 1:
+            argv = [*prefixes[0], *argv[1:]]
+    name = program_name(argv[0])
+    if name in ("bash", "sh"):
+        flag = next((index for index, arg in enumerate(argv[1:], start=1)
+                     if re.fullmatch(r"-[a-zA-Z]*c", arg)), None)
+        if flag is not None and flag + 1 < len(argv):
+            sub_errexit = any(re.fullmatch(r"-[a-zA-Z]*e[a-zA-Z]*", arg) for arg in argv[1:flag + 1])
+            return _parse_shell_command(argv[flag + 1], aliases=cmd_aliases,
+                                        errexit=sub_errexit, allow_errexit=True)
+        return [], [], [], []
+    if name in ("pwsh", "pwsh.exe", "powershell", "powershell.exe", "cmd", "cmd.exe"):
+        flag = next((index for index, arg in enumerate(argv[1:], start=1)
+                     if arg.lower() in ("-c", "-command", "/c")), None)
+        if flag is not None and flag + 1 < len(argv):
+            return _parse_shell_command(" ".join(argv[flag + 1:]), aliases=cmd_aliases,
+                                        errexit=False, allow_errexit=False)
+        return [], [], [], []
+    g_argvs, g_ev, c_argvs, c_ev = [argv], [], [argv], []
+    args = python_args(argv)
+    if args and program_name(args[0]) == "evidence.py" and args[1:2] == ["run"] and "--" in args:
+        inner_g, _, inner_c, _ = _parse_shell_command(args[args.index("--") + 1:], aliases=cmd_aliases,
+                                                      allow_errexit=True)
+        g_argvs.extend(inner_g)
+        c_argvs.extend(inner_c)
+        g_ev.append((argv, inner_g))
+        c_ev.append((argv, inner_g))
+    return g_argvs, g_ev, c_argvs, c_ev
+
+
+def _parse_shell_command(command, aliases=None, errexit=False, allow_errexit=True, out_aliases=None):
+    """Parse a command into guaranteed-exit vs candidate (argvs, evidence_runs).
+
+    Guaranteed commands are those that MUST have executed and exited 0 whenever the overall
+    shell invocation exited 0:
+    - final single simple command, or final pure `&&` chain (no `||`, `|`, `&`, control blocks, or `false`);
+    - non-final single simple command under active POSIX `set -e` (NOT `&&` lists, which POSIX `set -e`
+      exempts from exiting on failure, and NOT inside control-flow blocks or after `exit`/`return`).
+    """
     active_aliases = dict(aliases or {})
     if isinstance(command, list):
-        groups = [(command, dict(active_aliases))]
-    elif isinstance(command, str):
-        tokens = _tokenize_shell(command.strip())
-        if tokens is None:
-            return []
-        if any(is_op and tok in ("<<", "<<-") for tok, is_op in tokens):
-            return []
-        groups, current = [], []
-        keep_on_seq = errexit or not strict_chain
-        for tok, is_op in tokens:
-            if is_op and tok in ("&&", ";", "||", "|", "\n", "&"):
-                if tok == "&" and not current:
+        return _expand_command_group(command, active_aliases, allow_errexit=allow_errexit)
+    if not isinstance(command, str):
+        return [], [], [], []
+
+    tokens = _tokenize_shell(command.strip())
+    if tokens is None:
+        return [], [], [], []
+    if any(is_op and tok in ("<<", "<<-") for tok, is_op in tokens):
+        return [], [], [], []
+
+    # Split top-level statements on `;` and `\n`
+    statements, cur_stmt = [], []
+    for tok, is_op in tokens:
+        if is_op and tok in (";", "\n"):
+            if cur_stmt:
+                statements.append(cur_stmt)
+                cur_stmt = []
+        else:
+            cur_stmt.append((tok, is_op))
+    if cur_stmt:
+        statements.append(cur_stmt)
+
+    guaranteed_groups, candidate_groups = [], []
+    block_depth, paren_depth = 0, 0
+    terminated = False
+
+    for stmt_idx, stmt in enumerate(statements):
+        is_last = stmt_idx == len(statements) - 1
+        parts, ops, current = [], [], []
+        has_trailing_bg = False
+        has_paren = False
+
+        for tok, is_op in stmt:
+            if is_op and tok in ("(", ")"):
+                has_paren = True
+                if tok == "(":
+                    paren_depth += 1
+                else:
+                    paren_depth = max(0, paren_depth - 1)
+                if current:
+                    parts.append(current)
+                    current = []
+                ops.append(tok)
+                continue
+            if is_op and tok in ("&&", "||", "|", "&"):
+                if tok == "&" and not current and not parts:
                     continue  # PowerShell call operator `& $EV ...`
                 if current:
-                    if not _record_assignments(current, active_aliases, out_aliases=out_aliases):
-                        toggled = _is_set_errexit(current)
-                        if toggled is not None:
-                            errexit = toggled
-                            keep_on_seq = errexit or not strict_chain
-                        groups.append((current, dict(active_aliases)))
-                if tok in ("||", "|", "&") or (tok in (";", "\n") and not keep_on_seq):
-                    groups = []
-                current = []
+                    parts.append(current)
+                    current = []
+                ops.append(tok)
             else:
                 current.append(tok)
         if current:
-            if not _record_assignments(current, active_aliases, out_aliases=out_aliases):
-                groups.append((current, dict(active_aliases)))
-    else:
-        return []
+            parts.append(current)
+        elif ops and ops[-1] == "&":
+            has_trailing_bg = True
 
-    result = []
-    for argv, cmd_aliases in groups:
-        while argv:
-            if _is_env_assignment(argv[0]):
-                argv = argv[1:]
-            elif argv[0] == "env":
-                argv = argv[1:]
-                while argv and argv[0].startswith("-"):
-                    if argv[0] in ("-u", "--unset", "-C", "--chdir") and len(argv) > 1:
-                        argv = argv[2:]
-                    elif argv[0] == "--":
-                        argv = argv[1:]
-                        break
-                    else:
-                        argv = argv[1:]
-            else:
-                break
-        if not argv:
+        entered_control = False
+        for part in parts:
+            if not part:
+                continue
+            head = part[0]
+            if head in CONTROL_OPEN:
+                block_depth += 1
+                entered_control = True
+            elif head in CONTROL_CLOSE:
+                block_depth = max(0, block_depth - 1)
+                entered_control = True
+            elif head in CONTROL_MID:
+                entered_control = True
+
+        in_control = entered_control or block_depth > 0 or paren_depth > 0 or has_paren
+
+        # Case 1: single simple command (no &&, ||, |, trailing &, control block)
+        if len(parts) == 1 and not ops and not has_trailing_bg and not in_control:
+            argv = parts[0]
+            if _record_assignments(argv, active_aliases, out_aliases=None if terminated else out_aliases):
+                continue
+            if allow_errexit and not terminated:
+                toggled = _is_set_errexit(argv)
+                if toggled is not None:
+                    errexit = toggled
+            snap_aliases = dict(active_aliases)
+            candidate_groups.append((argv, snap_aliases))
+            stripped = _strip_env_prefix(argv)
+            if stripped and stripped[0] in EXIT_WORDS:
+                terminated = True
+                continue
+            if not terminated and (is_last or (allow_errexit and errexit)):
+                guaranteed_groups.append((argv, snap_aliases))
             continue
-        alias_match = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?", argv[0])
-        if alias_match and alias_match.group(1) in cmd_aliases:
-            alias_name = alias_match.group(1)
-            nested_aliases = {k: v for k, v in cmd_aliases.items() if k != alias_name}
-            prefixes = command_argvs(cmd_aliases[alias_name], aliases=nested_aliases, strict_chain=strict_chain)
-            if len(prefixes) == 1:
-                argv = [*prefixes[0], *argv[1:]]
-        name = program_name(argv[0])
-        if name in ("bash", "sh"):
-            flag = next((index for index, arg in enumerate(argv[1:], start=1)
-                         if re.fullmatch(r"-[a-zA-Z]*c", arg)), None)
-            if flag is not None and flag + 1 < len(argv):
-                sub_errexit = any(re.fullmatch(r"-[a-zA-Z]*e[a-zA-Z]*", arg) for arg in argv[1:flag + 1])
-                result.extend(command_argvs(argv[flag + 1], aliases=cmd_aliases,
-                                            strict_chain=strict_chain, errexit=sub_errexit))
+
+        # Case 2: pure `&&` chain (only guaranteed when it is the FINAL statement)
+        if parts and ops and all(op == "&&" for op in ops) and not has_trailing_bg and not in_control:
+            chain_aliases = dict(active_aliases)
+            chain_still_runs = not terminated
+            seen_command = False
+            for part in parts:
+                if _record_assignments(part, chain_aliases,
+                                       out_aliases=out_aliases if (not seen_command and not terminated) else None):
+                    if not seen_command and not terminated:
+                        active_aliases.update(chain_aliases)
+                    continue
+                seen_command = True
+                snap_aliases = dict(chain_aliases)
+                candidate_groups.append((part, snap_aliases))
+                stripped = _strip_env_prefix(part)
+                if stripped and (stripped[0] == "false" or stripped[0] in EXIT_WORDS):
+                    chain_still_runs = False
+                    if stripped[0] in EXIT_WORDS and is_last:
+                        terminated = True
+                    continue
+                if is_last and chain_still_runs:
+                    guaranteed_groups.append((part, snap_aliases))
             continue
-        if name in ("pwsh", "pwsh.exe", "powershell", "powershell.exe", "cmd", "cmd.exe"):
-            flag = next((index for index, arg in enumerate(argv[1:], start=1)
-                         if arg.lower() in ("-c", "-command", "/c")), None)
-            if flag is not None and flag + 1 < len(argv):
-                result.extend(command_argvs(" ".join(argv[flag + 1:]), aliases=cmd_aliases,
-                                            strict_chain=strict_chain))
-            continue
-        result.append(argv)
-        args = python_args(argv)
-        if args and program_name(args[0]) == "evidence.py" and args[1:2] == ["run"] and "--" in args:
-            result.extend(command_argvs(args[args.index("--") + 1:], aliases=cmd_aliases,
-                                        strict_chain=strict_chain))
-    return result
+
+        # Case 3: `||`, `|`, trailing `&`, control blocks, subshells -> never guaranteed
+        for part in parts:
+            if not part:
+                continue
+            head = part[0]
+            cleaned = part[1:] if head in (CONTROL_OPEN | CONTROL_CLOSE | CONTROL_MID) else part
+            if cleaned and not _record_assignments(cleaned, dict(active_aliases)):
+                candidate_groups.append((cleaned, dict(active_aliases)))
+
+    g_argvs, g_ev, c_argvs, c_ev = [], [], [], []
+    for argv, cmd_aliases in guaranteed_groups:
+        ga, ge, ca, ce = _expand_command_group(argv, cmd_aliases, allow_errexit=allow_errexit)
+        g_argvs.extend(ga)
+        g_ev.extend(ge)
+    for argv, cmd_aliases in candidate_groups:
+        _, _, ca, ce = _expand_command_group(argv, cmd_aliases, allow_errexit=allow_errexit)
+        c_argvs.extend(ca)
+        c_ev.extend(ce)
+    return g_argvs, g_ev, c_argvs, c_ev
+
+
+def command_argvs(command, aliases=None, errexit=False, allow_errexit=True, out_aliases=None):
+    """Recognize direct commands, shell wrappers and evidence wrappers; retain only guaranteed-exit commands."""
+    g_argvs, _, _, _ = _parse_shell_command(command, aliases=aliases, errexit=errexit,
+                                            allow_errexit=allow_errexit, out_aliases=out_aliases)
+    return g_argvs
 
 
 def is_test_command(command):
@@ -323,6 +461,31 @@ def background_agent_id(output):
     return xml_match.group(1) if xml_match else None
 
 
+def _strip_xml_payload_tags(text):
+    """Strip body payload containers so example tags inside review/result text never act as control fields."""
+    cleaned = text
+    tags = ("summary", "result", "output", "error")
+    for tag in tags:
+        cleaned = re.sub(rf"<{tag}\b[^>]*>.*</{tag}>", "", cleaned, flags=re.DOTALL | re.I)
+    for tag in tags:
+        cleaned = re.sub(rf"<{tag}\b[^>]*>.*$", "", cleaned, flags=re.DOTALL | re.I)
+    return cleaned
+
+
+def _parse_task_xml_fields(block):
+    """Parse top-level <task-id> and <status> from an XML-like task notification or TaskOutput block."""
+    try:
+        root = ET.fromstring(f"<root>{block}</root>")
+    except ET.ParseError:
+        header = _strip_xml_payload_tags(block)
+        ids = re.findall(r"<task-id>\s*([^<\s]+)\s*</task-id>", header)
+        statuses = [s.strip().lower() for s in re.findall(r"<status>\s*([^<]+?)\s*</status>", header)]
+        return ids, statuses
+    ids = [child.text.strip() for child in root if child.tag == "task-id" and child.text and child.text.strip()]
+    statuses = [child.text.strip().lower() for child in root if child.tag == "status" and child.text and child.text.strip()]
+    return ids, statuses
+
+
 def task_completed(output):
     try:
         parsed = json.loads(output)
@@ -330,7 +493,8 @@ def task_completed(output):
         parsed = None
     if isinstance(parsed, dict):
         return parsed.get("status") == "completed" and not parsed.get("error")
-    return "<status>completed</status>" in output
+    _, statuses = _parse_task_xml_fields(output)
+    return statuses == ["completed"]
 
 
 def codex_tool_uses(item):
@@ -420,12 +584,16 @@ class Context:
                 if name in ("Bash", "PowerShell"):
                     command = data.get("command", "")
                     prior_aliases = dict(turn_aliases)
-                    argvs = command_argvs(command, aliases=prior_aliases, out_aliases=turn_aliases)
-                    all_argvs = command_argvs(command, aliases=prior_aliases, strict_chain=False)
+                    allow_errexit = name != "PowerShell"
+                    argvs, ev_runs, cand_argvs, cand_ev_runs = _parse_shell_command(
+                        command, aliases=prior_aliases, allow_errexit=allow_errexit, out_aliases=turn_aliases,
+                    )
                     executions.append({
                         "command": command,
                         "argvs": argvs,
-                        "all_argvs": all_argvs,
+                        "evidence_runs": ev_runs,
+                        "candidate_argvs": cand_argvs,
+                        "candidate_evidence_runs": cand_ev_runs,
                         "exit_code": data.get("exit_code"),
                         "is_error": data.get("output_error"),
                         "output_present": data.get("output_present", False),
@@ -436,16 +604,16 @@ class Context:
         return executions
 
     def completed_task_notifications(self, turn=None):
-        """Task IDs reported completed via Claude Code <task-notification> user messages."""
+        """Task IDs reported completed via Claude Code <task-notification> user messages (top-level fields only)."""
         completed = set()
         for event in self.events(turn):
             if event.get("type") != "user":
                 continue
             text = output_text((event.get("message") or {}).get("content"))
             for block in re.findall(r"<task-notification>(.*?)</task-notification>", text, re.DOTALL):
-                match = re.search(r"<task-id>\s*([^<\s]+)\s*</task-id>", block)
-                if match and "<status>completed</status>" in block:
-                    completed.add(match.group(1))
+                ids, statuses = _parse_task_xml_fields(block)
+                if len(ids) == 1 and statuses == ["completed"]:
+                    completed.add(ids[0])
         return completed
 
     def bash_commands(self, turn=None):
@@ -714,12 +882,17 @@ def tests_added(ctx, rel_dir="tests"):
 
 def ran_tests(ctx, turn=None):
     hits = [execution for execution in ctx.shell_executions(turn)
-            if any(is_test_command(argv) for argv in execution["argvs"])]
+            if any(is_test_command(argv) for argv in execution["candidate_argvs"])]
     if not hits:
         return Check("实际运行了测试命令且最终通过", False, "未发现测试命令", category="functional")
     last = hits[-1]
     if last["exit_code"] is None or not last["output_present"]:
         return Check("实际运行了测试命令且最终通过", False, "测试命令缺少完成结果或退出码",
+                     category="functional", status="unknown")
+    guaranteed = any(is_test_command(argv) for argv in last["argvs"])
+    if not guaranteed:
+        return Check("实际运行了测试命令且最终通过", False,
+                     f"最后一次测试命令处于条件或非末尾链，无法确认执行结果：{last['command'][:100]}",
                      category="functional", status="unknown")
     if not execution_succeeded(last):
         return Check("实际运行了测试命令且最终通过", False,
@@ -745,41 +918,73 @@ def baseline_before_edit(ctx, required=None):
     return Check("修改前先跑基线", ok, detail, required=req, category="compliance")
 
 
+def _confirmed_evidence_run(execution, matches, valid_snapshots):
+    """True when `execution` provably ran `evidence.py run` matching `matches` and exited 0."""
+    if execution_succeeded(execution):
+        for _, inner_argvs in execution["evidence_runs"]:
+            if any(matches(argv) for argv in inner_argvs):
+                return True
+    # Non-guaranteed chain position (e.g. multiline `$EV run ...\n$EV report` without `set -e`):
+    # only accept when the tool output contains evidence.py's own exit=0 + matching snapshot line.
+    if execution.get("output_present") is True and valid_snapshots:
+        output = execution.get("output", "")
+        for _, inner_argvs in execution["candidate_evidence_runs"]:
+            if any(matches(argv) for argv in inner_argvs):
+                if any(f"[evidence] exit=0 snapshot={snap}" in output for snap in valid_snapshots):
+                    return True
+    return False
+
+
 def evidence_recorded(ctx, turn=None, required=None, validations=None):
     req = ctx.plugin if required is None else required
     validations = validations or {"测试": is_test_command}
     executions = ctx.shell_executions(turn)
-    runs = [execution for execution in executions
-            if any(is_evidence_call(argv, "run") for argv in execution["all_argvs"])]
-    reports = [execution for execution in executions
-               if any(is_evidence_call(argv, "report") for argv in execution["all_argvs"])]
+    runs = [execution for execution in executions if execution["candidate_evidence_runs"]]
+    guaranteed_reports = [execution for execution in executions
+                          if any(is_evidence_call(argv, "report") for argv in execution["argvs"])]
+    candidate_reports = [execution for execution in executions
+                         if any(is_evidence_call(argv, "report") for argv in execution["candidate_argvs"])]
     data = ctx.evidence_report()
     records = data.get("records", []) if data else []
     passing = [record for record in records if record.get("exit") == 0 and record.get("label") != "baseline"]
     current = [record for record in passing if record.get("status") == "valid"]
-    missing_runs = [name for name, matches in validations.items()
-                    if not any(matches(record.get("argv") or record.get("cmd", "")) for record in passing)]
-    missing_current = [name for name, matches in validations.items()
-                       if not any(matches(record.get("argv") or record.get("cmd", "")) for record in current)]
-    missing_calls = [name for name, matches in validations.items()
-                     if not any(execution_succeeded(execution)
-                                and any(matches(argv) for argv in execution["all_argvs"]) for execution in runs)]
+    missing_runs, missing_current, missing_calls, unknown_calls = [], [], [], []
+    for name, matches in validations.items():
+        matched_passing = [record for record in passing if matches(record.get("argv") or record.get("cmd", ""))]
+        matched_current = [record for record in current if matches(record.get("argv") or record.get("cmd", ""))]
+        if not matched_passing:
+            missing_runs.append(name)
+        if not matched_current:
+            missing_current.append(name)
+        valid_snaps = {str(record.get("snapshot", ""))[:12] for record in matched_passing if record.get("snapshot")}
+        if not any(_confirmed_evidence_run(execution, matches, valid_snaps) for execution in runs):
+            missing_calls.append(name)
+            if any(any(matches(argv) for _, inner in execution["candidate_evidence_runs"] for argv in inner)
+                   for execution in runs):
+                unknown_calls.append(name)
+    report_called = any(execution_succeeded(execution) for execution in guaranteed_reports)
+    report_unknown = not report_called and bool(candidate_reports) and not missing_current and not missing_calls
     run_ok = not missing_calls and not missing_runs
-    report_ok = any(execution_succeeded(execution) for execution in reports) and not missing_calls and not missing_current
+    report_ok = report_called and not missing_calls and not missing_current
+    run_unknown = not run_ok and not missing_runs and bool(unknown_calls) and set(missing_calls) == set(unknown_calls)
     run_detail = f"{len(runs)} 次，落盘 {len(records)} 条"
-    report_detail = f"{len(reports)} 次，当前有效且通过 {len(current)} 条"
+    report_detail = f"{len(guaranteed_reports)} 次，当前有效且通过 {len(current)} 条"
     if missing_runs:
         run_detail += "，缺少通过证据：" + "、".join(missing_runs)
     if missing_current:
         report_detail += "，缺少当前有效证据：" + "、".join(missing_current)
     if missing_calls:
-        detail = "，缺少成功返回的验证调用：" + "、".join(missing_calls)
+        detail = "，缺少已确认成功的验证调用：" + "、".join(missing_calls)
         run_detail += detail
         report_detail += detail
+    if not report_called and candidate_reports:
+        report_detail += "，存在非末尾/条件链上的 report 调用，无法确认是否执行"
 
     return [
-        Check("用 evidence.py run 记录验证", run_ok, run_detail, required=req, category="compliance"),
-        Check("用 evidence.py report 生成当前有效证据表", report_ok, report_detail, required=req, category="compliance"),
+        Check("用 evidence.py run 记录验证", run_ok, run_detail, required=req, category="compliance",
+              status="unknown" if run_unknown else ""),
+        Check("用 evidence.py report 生成当前有效证据表", report_ok, report_detail, required=req, category="compliance",
+              status="unknown" if (report_unknown or (not report_ok and report_called and run_unknown and not missing_current)) else ""),
     ]
 
 

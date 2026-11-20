@@ -62,14 +62,19 @@ def project_cli_behavior(ctx):
 
 def real_cli_exercised(ctx, turn=1):
     """Check that the agent actually invoked the generated project's CLI entrypoint with exit code 0."""
-    hits = [exe for exe in ctx.shell_executions(turn)
-            if any(invokes_python_module(argv, "ledger", sub)
-                   for argv in exe["argvs"] for sub in ("add", "list"))]
-    passing = [exe for exe in hits if execution_succeeded(exe)]
-    unknown = bool(hits) and not passing and any(
-        exe["exit_code"] is None or not exe["output_present"] for exe in hits)
+    executions = ctx.shell_executions(turn)
+    guaranteed_hits = [exe for exe in executions
+                       if any(invokes_python_module(argv, "ledger", sub)
+                              for argv in exe["argvs"] for sub in ("add", "list"))]
+    passing = [exe for exe in guaranteed_hits if execution_succeeded(exe)]
+    candidate_hits = [exe for exe in executions
+                      if any(invokes_python_module(argv, "ledger", sub)
+                             for argv in exe["candidate_argvs"] for sub in ("add", "list"))]
+    unknown = (not passing and bool(candidate_hits)
+               and (any(exe["exit_code"] is None or not exe["output_present"] for exe in guaranteed_hits)
+                    or len(candidate_hits) > len(guaranteed_hits)))
     return Check("真实运行了 CLI 入口验证", bool(passing),
-                 passing[0]["command"][:120] if passing else "未发现通过的项目 CLI 入口调用",
+                 passing[0]["command"][:120] if passing else "未发现已确认通过的项目 CLI 入口调用",
                  required=True, category="functional", status="unknown" if unknown else "")
 
 

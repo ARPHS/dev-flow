@@ -18,7 +18,7 @@
 
 ## 不进入版本库
 
-创建 `.dev-flow/` 时同时写入 `.dev-flow/.gitignore`，内容只有一行 `*`：整个目录（包括这个文件本身）不会出现在 `git status` 中，也不修改项目自己的 `.gitignore` 或 `.git/`（Codex 默认沙箱禁止写 `.git/`）。用户希望共享台账时，把这个文件改为只忽略 `objects/`、`evidence.jsonl` 和 `index-*`。
+创建 `.dev-flow/` 时同时写入 `.dev-flow/.gitignore`，内容只有一行 `*`：整个目录（包括这个文件本身）不会出现在 `git status` 中，也不修改项目自己的 `.gitignore` 或 `.git/`（Codex 默认沙箱禁止写 `.git/`）。用户希望共享台账时，把这个文件改为只忽略 `objects/`、`evidence.jsonl`、`logs/` 和 `index-*`。
 
 ## 模板
 

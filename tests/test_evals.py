@@ -790,6 +790,10 @@ class EvalCasesTest(unittest.TestCase):
         self._apply_feature_solution(ws)
         record_evidence(ws, "unit", sys.executable, "-m", "unittest", "discover", "-s", "tests")
         record_evidence(ws, "json", sys.executable, "-m", "ledger", "list", "--json")
+        snap12 = json.loads(
+            subprocess.run([sys.executable, str(EVIDENCE_CLI), "report", "--json"],
+                           cwd=ws, capture_output=True, text=True, check=True).stdout
+        )["short_snapshot"]
 
         # Claude persistent Bash session: define EV once, reuse $EV across later tool calls
         persistent_transcript = fake_transcript(
@@ -803,42 +807,107 @@ class EvalCasesTest(unittest.TestCase):
         checks = load_grader("feature")(self.context("ledger", ws, base, persistent_transcript, plugin=True))
         self.assertEqual(required_failures(checks), [])
 
-        # Multiline evidence block (as documented in sandbox.md)
-        multiline_transcript = fake_transcript(
-            ("Bash", {"command": 'EV="python3 /p/evidence.py"\n'
-                                 '$EV run -l unit -- python3 -m unittest discover -s tests\n'
-                                 '$EV run -l json -- python3 -m ledger list --json\n'
-                                 '$EV report'}),
-        )
         validations = {
             "测试": lib.is_test_command,
             "JSON 入口": lambda command: lib.invokes_python_module(command, "ledger", "list", "--json"),
         }
-        ev_checks = lib.evidence_recorded(self.context("ledger", ws, base, multiline_transcript, plugin=True),
+
+        # Multiline evidence block under `set -e` (each line is a single simple command) passes
+        set_e_multiline = fake_transcript(
+            ("Bash", {"command": 'set -e\n'
+                                 'EV="python3 /p/evidence.py"\n'
+                                 '$EV run -l unit -- python3 -m unittest discover -s tests\n'
+                                 '$EV run -l json -- python3 -m ledger list --json\n'
+                                 '$EV report'}),
+        )
+        ev_set_e = lib.evidence_recorded(self.context("ledger", ws, base, set_e_multiline, plugin=True),
+                                         validations=validations)
+        self.assertTrue(all(c.ok for c in ev_set_e), [c.detail for c in ev_set_e])
+
+        # Multiline block WITHOUT `set -e` passes only when stdout carries evidence.py's own exit=0 snapshot proof
+        multiline_cmd = ('EV="python3 /p/evidence.py"\n'
+                         '$EV run -l unit -- python3 -m unittest discover -s tests\n'
+                         '$EV run -l json -- python3 -m ledger list --json\n'
+                         '$EV report')
+        multiline_with_proof = fake_transcript(
+            ("Bash", {"command": multiline_cmd}, False,
+             f"[evidence] exit=0 snapshot={snap12} 已记录到 .dev-flow/evidence.jsonl\n"),
+        )
+        ev_checks = lib.evidence_recorded(self.context("ledger", ws, base, multiline_with_proof, plugin=True),
                                           validations=validations)
         self.assertTrue(all(c.ok for c in ev_checks), [c.detail for c in ev_checks])
 
-        # `evidence.py report || true` must still be rejected
-        masked_report = fake_transcript(
-            ("Bash", {"command": "python /p/evidence.py run -l unit -- python -m unittest discover -s tests"}),
-            ("Bash", {"command": "python /p/evidence.py report || true"}),
+        # Same multiline block WITHOUT output confirmation must NOT pass (status="unknown")
+        multiline_unconfirmed = fake_transcript(("Bash", {"command": multiline_cmd}, False, "ok"))
+        run_unk, rep_unk = lib.evidence_recorded(self.context("ledger", ws, base, multiline_unconfirmed, plugin=True),
+                                                 validations=validations)
+        self.assertFalse(run_unk.ok)
+        self.assertEqual(run_unk.status, "unknown")
+        self.assertFalse(rep_unk.ok)
+
+        # Short-circuited / masked report & run commands MUST NOT pass
+        for bad_report_cmd in ("python /p/evidence.py report || true",
+                               "false && python /p/evidence.py report; true"):
+            with self.subTest(bad_report_cmd=bad_report_cmd):
+                masked_report = fake_transcript(
+                    ("Bash", {"command": "python /p/evidence.py run -l unit -- python -m unittest discover -s tests"}),
+                    ("Bash", {"command": bad_report_cmd}),
+                )
+                _, report_chk = lib.evidence_recorded(self.context("ledger", ws, base, masked_report, plugin=True))
+                self.assertFalse(report_chk.ok)
+                self.assertEqual(report_chk.status, "unknown")
+
+        # Unrelated `evidence.py run -- python --version && python -m unittest` must NOT count as evidence for tests
+        split_ev = fake_transcript(
+            ("Bash", {"command": "python /p/evidence.py run -l env -- python --version && python -m unittest discover -s tests"}),
+            ("Bash", {"command": "python /p/evidence.py report"}),
         )
-        _, report_chk = lib.evidence_recorded(self.context("ledger", ws, base, masked_report, plugin=True))
-        self.assertFalse(report_chk.ok)
+        split_run, split_rep = lib.evidence_recorded(self.context("ledger", ws, base, split_ev, plugin=True))
+        self.assertFalse(split_run.ok)
+        self.assertFalse(split_rep.ok)
 
     def test_shell_parsing_env_spaces_set_e_powershell_and_escaped_quotes(self):
         # Env assignment with spaces in quoted value
         spaced_env = 'LEDGER_FILE="/tmp/my ledger.json" python -m ledger list --json'
         self.assertTrue(lib.invokes_python_module(spaced_env, "ledger", "list", "--json"))
 
-        # set -e preserves earlier commands across newlines, while || true is still rejected
+        # set -e preserves single simple commands across newlines, while conditional `&&` / `||` / `if` / `; true` do not
         set_e_script = ("set -e\n"
                         "LEDGER_FILE=/tmp/a.json python3 -m ledger add 12.5 lunch\n"
                         "LEDGER_FILE=/tmp/a.json python3 -m ledger list")
         self.assertTrue(lib.invokes_python_module(set_e_script, "ledger", "add"))
         self.assertTrue(lib.invokes_python_module(set_e_script, "ledger", "list"))
-        self.assertFalse(lib.invokes_python_module("set -e\npython -m ledger list --json || true",
-                                                   "ledger", "list", "--json"))
+        for unguaranteed in (
+            "set -e\npython -m ledger list --json || true",
+            "set -e; false && python -m unittest discover -s tests; true",
+            "set -e; python -m unittest discover -s tests && true; true",
+            "set -e\nif false; then\npython -m unittest discover -s tests\nfi\ntrue",
+            "set -e; exit 0; python -m unittest discover -s tests",
+        ):
+            with self.subTest(unguaranteed=unguaranteed):
+                self.assertFalse(lib.is_test_command(unguaranteed))
+                self.assertFalse(lib.invokes_python_module(unguaranteed, "ledger", "list", "--json"))
+
+        # ran_tests marks conditional/masked test runs as unknown (never pass), even after an earlier passing run
+        for masked_cmd in (
+            "set -e; false && python -m unittest discover -s tests; true",
+            "set -e; python -m unittest discover -s tests && true; true",
+            "python -m unittest discover -s tests; true",
+        ):
+            with self.subTest(masked_cmd=masked_cmd):
+                t = fake_transcript(("Bash", {"command": masked_cmd}))
+                chk = lib.ran_tests(Context(ws=Path(self.tmp.name), fixture=FIXTURES / "ledger", base="", transcripts=[t]))
+                self.assertFalse(chk.ok)
+                self.assertEqual(chk.status, "unknown")
+
+        masked_after_pass = fake_transcript(
+            ("Bash", {"command": "python -m unittest discover -s tests"}),
+            ("Bash", {"command": "python -m unittest discover -s tests; true"}),
+        )
+        chk_after = lib.ran_tests(Context(ws=Path(self.tmp.name), fixture=FIXTURES / "ledger",
+                                          base="", transcripts=[masked_after_pass]))
+        self.assertFalse(chk_after.ok)
+        self.assertEqual(chk_after.status, "unknown")
 
         # PowerShell `$EV = "..." ; & $EV ...`
         ps_cmd = '$EV = "python /p/evidence.py"; & $EV run -l unit -- python -m unittest discover -s tests'
@@ -859,12 +928,22 @@ class EvalCasesTest(unittest.TestCase):
         notif_ok = json.dumps({
             "type": "user",
             "message": {"content": "<task-notification><task-id>rev-42</task-id>"
-                                   "<status>completed</status><result>LGTM</result></task-notification>"},
+                                   "<status>completed</status><result>LGTM: if a < b && c > 0</result></task-notification>"},
         })
         notif_fail = json.dumps({
             "type": "user",
             "message": {"content": "<task-notification><task-id>rev-42</task-id>"
                                    "<status>failed</status></task-notification>"},
+        })
+        notif_fail_with_body_example = json.dumps({
+            "type": "user",
+            "message": {"content": "<task-notification><task-id>rev-42</task-id><status>failed</status>"
+                                   "<result>Example: <status>completed</status></result></task-notification>"},
+        })
+        notif_fail_nonxml_body = json.dumps({
+            "type": "user",
+            "message": {"content": "<task-notification><task-id>rev-42</task-id><status>failed</status>"
+                                   "<result>a < b && <status>completed</status></result></task-notification>"},
         })
         notif_other = json.dumps({
             "type": "user",
@@ -877,9 +956,14 @@ class EvalCasesTest(unittest.TestCase):
                       transcripts=["\n".join([base_transcript, notif_ok, end])])
         self.assertEqual(required_failures(lib.independent_review(ctx)), [])
 
-        for bad_notif in (notif_fail, notif_other):
-            ctx.transcripts = ["\n".join([base_transcript, bad_notif, end])]
-            self.assertFalse(lib.independent_review(ctx)[1].ok)
+        for bad_notif in (notif_fail, notif_fail_with_body_example, notif_fail_nonxml_body, notif_other):
+            with self.subTest(bad_notif=bad_notif):
+                ctx.transcripts = ["\n".join([base_transcript, bad_notif, end])]
+                self.assertFalse(lib.independent_review(ctx)[1].ok)
+
+        # TaskOutput XML must also inspect top-level status rather than body text
+        self.assertFalse(lib.task_completed("<status>failed</status><output><status>completed</status></output>"))
+        self.assertTrue(lib.task_completed("<status>completed</status><output>diff: a < b</output>"))
 
         # Codex wait_agent with dict payload under `completed`
         present, is_err, completed = self.run_module._analyze_collab_output(
