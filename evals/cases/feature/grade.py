@@ -1,9 +1,9 @@
 import json
-import re
 import tempfile
 from pathlib import Path
 
-from lib import (Check, baseline_before_edit, evidence_recorded, no_commits, original_asserts_intact, ran_tests,
+from lib import (Check, baseline_before_edit, evidence_recorded, execution_succeeded, invokes_python_module,
+                 is_test_command, no_commits, original_asserts_intact, original_tests_pass, ran_tests,
                  skill_used, tests_added, unit_tests_pass)
 
 
@@ -26,36 +26,39 @@ def json_output(ctx):
     except ValueError:
         empty_ok = False
     return [
-        Check("list --json 输出正确", ok, detail),
-        Check("无记录时输出 []", empty_ok, empty.stdout.strip()[:60], required=False),
+        Check("list --json 输出正确", ok, detail, category="functional"),
+        Check("无记录时输出 []", empty_ok, empty.stdout.strip()[:60], required=False, category="advisory"),
     ]
 
 
 def cli_json_invoked(ctx):
-    """--json on a command line, or inside a script the agent wrote and then ran."""
-    direct = ctx.ran(r"--json")
-    if direct:
-        return Check("真实调用了 --json", True, direct[0][:120])
-    for command in ctx.bash_commands():
-        for name in re.findall(r"[\w./\\-]+\.py", command):
-            script = ctx.ws / name
-            if script.is_file() and "--json" in script.read_text(encoding="utf-8", errors="replace"):
-                return Check("真实调用了 --json", True, f"通过 {name}")
-    return Check("真实调用了 --json", False, "命令和被执行的脚本中都没有 --json")
+    hits = [execution for execution in ctx.shell_executions()
+            if invokes_python_module(execution["command"], "ledger", "list", "--json")]
+    passing = [execution for execution in hits if execution_succeeded(execution)]
+    unknown = bool(hits) and not passing and any(execution["exit_code"] is None for execution in hits)
+    return Check("真实调用了 --json", bool(passing),
+                 passing[0]["command"][:120] if passing else "未发现成功完成的 ledger list --json 调用",
+                 category="functional", status="unknown" if unknown else "")
 
 
 def grade(ctx):
     return [
         *json_output(ctx),
         unit_tests_pass(ctx),
-        original_asserts_intact(ctx),
+        original_tests_pass(ctx),
+        original_asserts_intact(ctx, required=False),
         tests_added(ctx),
         ran_tests(ctx),
         cli_json_invoked(ctx),
         no_commits(ctx),
         baseline_before_edit(ctx),
         skill_used(ctx, "df-flow"),
-        *evidence_recorded(ctx),
-        Check("创建了 .dev-flow/progress.md", (ctx.ws / ".dev-flow" / "progress.md").exists(), required=False),
-        Check("报告包含退出码", any(k in ctx.final_text() for k in ("退出码", "exit")), required=False),
+        *evidence_recorded(ctx, validations={
+            "测试": is_test_command,
+            "JSON 入口": lambda command: invokes_python_module(command, "ledger", "list", "--json"),
+        }),
+        Check("创建了 .dev-flow/progress.md", (ctx.ws / ".dev-flow" / "progress.md").exists(),
+              required=False, category="compliance"),
+        Check("报告包含退出码", any(k in ctx.final_text() for k in ("退出码", "exit")),
+              required=False, category="advisory"),
     ]

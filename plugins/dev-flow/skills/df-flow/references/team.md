@@ -17,7 +17,7 @@
 ## 审查代理（df-reviewer）
 
 - 在新上下文中运行，避免继承实现者的假设。
-- 派发时提供：基线提交（`git merge-base` 或开工时的 HEAD）、验收条件、`df-verify` 证据、需要重点关注的风险。
+- 派发时提供：基线提交（`git merge-base` 或开工时的 HEAD）、开工与候选版本快照、本次改动文件清单、核心入口命令、验收条件、`df-verify` 证据、需要重点关注的风险。存在开工前脏改动时，按两快照差异区分具体改动，不排除整个重叠文件。
 - 审查代理只读代码和文档，可以运行测试和只读命令，不修改任何文件或 Git 状态。
 - 报告按 Critical、Important、Minor 分级。
 
@@ -26,7 +26,7 @@
 角色定义在插件根目录的 [df-implementer.md](../../../agents/df-implementer.md) 和 [df-reviewer.md](../../../agents/df-reviewer.md)。
 
 - **Claude Code**：直接按名称调用 `df-implementer`、`df-reviewer` 子代理，工具限制由代理定义生效。
-- **Codex**：插件中的代理定义不会注册为代理类型。用 `spawn_agent` 并设置 `fork_turns: "none"`（不继承当前对话，保证审查独立），消息内容为对应角色文件去掉开头 `---` 元数据后的正文，加上派发材料。这里的只读、不提交等限制只靠文字约束：审查结束后主控用 `git status --short` 确认工作区没有被改动。派发后必须用 `wait_agent` 等到审查结果返回（超时就继续等），把结论纳入最终报告后再结束回复；结束前用 `list_agents` 确认没有仍在运行的子代理，残留的用 `interrupt_agent` 停止。审查还没返回就输出最终报告，等于没有做独立审查。
+- **Codex**：插件中的代理定义不会注册为代理类型。用 `spawn_agent`，审查任务命名为 `task_name: "df_review"`，并设置 `fork_turns: "none"`（不继承当前对话，保证审查独立）；消息为对应角色文件去掉开头 `---` 元数据后的正文，加上派发材料。保存返回的 `agent_id`，用 `wait_agent` 等到该审查代理成功 `completed` 并取得报告，不能用实现或探索代理的完成状态代替。这里的只读、不提交等限制只靠文字约束：审查结束后主控用 `git status --short` 确认工作区没有被改动。超时继续等，派发或等待失败则如实报告降级；把结论纳入最终报告后再结束回复。结束前用 `list_agents` 确认没有仍在运行的子代理，残留的用 `interrupt_agent` 停止。
 - **Codex 默认沙箱**禁止写 `.git/`，`git worktree add` 和提交都会失败。需要并行时先向用户申请提权；未获批准就串行实现。
 - **没有子代理能力**：实现由当前 agent 串行完成；审查建议用户在新会话中运行 `df-review`，或当前 agent 按 `df-review` 步骤逐项审查，并在报告中注明"非独立审查"。
 

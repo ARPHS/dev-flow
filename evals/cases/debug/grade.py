@@ -1,5 +1,5 @@
-from lib import (Check, no_commits, original_asserts_intact, ran_tests, skill_used, tests_added,
-                 unit_tests_pass)
+from lib import (Check, no_commits, original_asserts_intact, original_tests_pass, ran_tests, skill_used,
+                 tests_added, unit_tests_pass)
 
 HIDDEN = r"""
 import sys
@@ -22,9 +22,10 @@ def grade(ctx):
     hidden = ctx.python("-c", HIDDEN)
     return [
         Check("隐藏用例：各种数量和页大小都完整导出", hidden.returncode == 0,
-              (hidden.stdout + hidden.stderr).strip()[:160]),
+              (hidden.stdout + hidden.stderr).strip()[:160], category="functional"),
         unit_tests_pass(ctx),
-        original_asserts_intact(ctx),
+        original_tests_pass(ctx),
+        original_asserts_intact(ctx, required=False),
         tests_added(ctx),
         ran_tests(ctx),
         no_commits(ctx),

@@ -1,6 +1,8 @@
 import io
+import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -264,6 +266,154 @@ class EvidenceTest(unittest.TestCase):
         proc = cli(other, "run", *py("print(1)"))
         self.assertIn("已记录", proc.stdout, proc.stderr)
         self.assertIn("当前有效", cli(other, "report").stdout)
+
+    def test_single_arg_executable_path_with_spaces_allowed(self):
+        spaced_dir = Path(self.tmp.name) / "dir with spaces"
+        spaced_dir.mkdir()
+        if os.name == "nt":
+            script = spaced_dir / "run tool.cmd"
+            script.write_text("@echo spaced-ok\r\n", encoding="utf-8")
+        else:
+            script = spaced_dir / "run tool.sh"
+            script.write_text("#!/bin/sh\necho spaced-ok\n", encoding="utf-8")
+            script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        proc = cli(self.repo, "run", "-l", "spaced", "--", str(script))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("spaced-ok", proc.stdout)
+        records = evidence.load_records(self.repo)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["exit"], 0)
+
+    def test_chinese_and_space_filenames_in_report(self):
+        cli(self.repo, "run", "-l", "unit", *py("print('ok')"))
+        self.write("中文 目录/测试 文件.py", "x = 1\n")
+        self.write("数据[1].json", "{}\n")
+        md = cli(self.repo, "report").stdout
+        self.assertIn("中文 目录/测试 文件.py", md)
+        self.assertIn("数据[1].json", md)
+        self.assertNotIn("\\344", md)
+        raw_json = cli(self.repo, "report", "--json")
+        self.assertEqual(raw_json.returncode, 0, raw_json.stderr)
+        data = json.loads(raw_json.stdout)
+        self.assertEqual(data["records"][0]["status"], "changed")
+        self.assertIn("中文 目录/测试 文件.py", data["records"][0]["changes"])
+
+    def test_report_json_structure_and_valid_status(self):
+        cli(self.repo, "run", "-l", "AC1", *py("print('all good')"))
+        proc = cli(self.repo, "report", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertEqual(len(data["records"]), 1)
+        rec = data["records"][0]
+        self.assertEqual(rec["label"], "AC1")
+        self.assertEqual(rec["exit"], 0)
+        self.assertEqual(rec["status"], "valid")
+        self.assertEqual(rec["changes"], [])
+        self.assertIsNotNone(rec["duration_s"])
+        self.assertEqual(rec["argv"], [sys.executable, "-c", "print('all good')"])
+
+    def test_snapshot_diff_is_readonly_and_separates_existing_edits(self):
+        self.write("a.py", "user_change = 2\n")
+        before = self.fp()
+        self.write("a.py", "user_change = 2\ntask_change = 3\n")
+        self.write("new.py", "task_added = True\n")
+        after = self.fp()
+        index = (self.repo / ".git/index").read_bytes()
+        count = object_count(self.repo)
+        objects = self.repo / ".dev-flow/objects"
+        saved = {path.relative_to(objects).as_posix(): path.read_bytes()
+                 for path in objects.rglob("*") if path.is_file()}
+        proc = cli(self.repo, "diff", before, after)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("+task_change = 3", proc.stdout)
+        self.assertIn("+task_added = True", proc.stdout)
+        self.assertNotIn("+user_change", proc.stdout)
+        self.assertNotIn("-user_change", proc.stdout)
+        self.assertEqual((self.repo / ".git/index").read_bytes(), index)
+        self.assertEqual(object_count(self.repo), count)
+        self.assertEqual({path.relative_to(objects).as_posix(): path.read_bytes()
+                          for path in objects.rglob("*") if path.is_file()}, saved)
+
+    def test_snapshot_diff_without_objects_does_not_create_state(self):
+        shutil.rmtree(self.repo / ".dev-flow")
+        proc = cli(self.repo, "diff", "0" * 40, "1" * 40)
+        self.assertEqual(proc.returncode, 1)
+        self.assertFalse((self.repo / ".dev-flow").exists())
+
+    def test_huge_output_summarized_and_saved_to_log(self):
+        lines_code = "for i in range(400): print(f'line-{i:04d}-' + 'x' * 40)"
+        proc = cli(self.repo, "run", "-l", "verbose", *py(lines_code))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("已省略中间", proc.stdout)
+        self.assertIn(".dev-flow/logs/", proc.stdout)
+        records = evidence.load_records(self.repo)
+        log_rel = records[-1]["log"]
+        full_text = (self.repo / log_rel).read_text(encoding="utf-8")
+        self.assertIn("line-0200-", full_text)
+        # --full-output bypasses truncation
+        full_proc = cli(self.repo, "run", "--full-output", "-l", "verbose2", *py(lines_code))
+        self.assertEqual(full_proc.returncode, 0, full_proc.stdout)
+        self.assertIn("line-0200-", full_proc.stdout)
+        self.assertNotIn("已省略中间", full_proc.stdout)
+        # Without .dev-flow/ (no saved log), stdout must NOT be truncated
+        shutil.rmtree(self.repo / ".dev-flow")
+        no_state_proc = cli(self.repo, "run", "-l", "verbose3", *py(lines_code))
+        self.assertEqual(no_state_proc.returncode, 0, no_state_proc.stderr)
+        self.assertIn("line-0200-", no_state_proc.stdout)
+        self.assertNotIn("已省略中间", no_state_proc.stdout)
+
+    def test_huge_output_preserved_when_log_save_fails(self):
+        lines_code = "for i in range(400): print(f'line-{i:04d}-' + 'x' * 40)"
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.repo)
+            with mock.patch.object(evidence, "save_log", side_effect=OSError("disk full")), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                code = evidence.main(["run", "-l", "verbose", *py(lines_code)])
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(code, 0)
+        self.assertIn("line-0200-", out.getvalue())
+        self.assertNotIn("已省略中间", out.getvalue())
+
+    def test_doctor_fails_when_git_status_fails(self):
+        # Corrupt .git/index so repo_root succeeds but git status fails
+        (self.repo / ".git/index").write_bytes(b"corrupted-index")
+        proc = cli(self.repo, "doctor", "--json")
+        self.assertEqual(proc.returncode, 1)
+        info = json.loads(proc.stdout)
+        self.assertFalse(info["ok"])
+        repo_check = next(c for c in info["checks"] if c["name"] == "git_repo")
+        self.assertFalse(repo_check["ok"])
+
+    def test_cross_stack_cache_files_ignored(self):
+        base = self.fp()
+        self.write(".coverage", "binary")
+        self.write("web/.vitest/cache.json", "{}")
+        self.write("web/tsconfig.tsbuildinfo", "{}")
+        self.assertEqual(self.fp(), base)
+
+    def test_doctor_readonly_diagnostics(self):
+        proc = cli(self.repo, "doctor", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        info = json.loads(proc.stdout)
+        self.assertTrue(info["ok"])
+        self.assertTrue(info["state"]["present"])
+        self.assertTrue(info["state"]["gitignore_ok"])
+        # Without .dev-flow/, doctor must stay strictly read-only and never create it
+        shutil.rmtree(self.repo / ".dev-flow")
+        proc2 = cli(self.repo, "doctor")
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertIn("dev-flow 环境诊断", proc2.stdout)
+        self.assertFalse((self.repo / ".dev-flow").exists())
+
+    def test_relative_cwd_in_subdirectory(self):
+        sub = self.repo / "pkg" / "sub"
+        sub.mkdir(parents=True)
+        proc = cli(sub, "run", "-l", "sub", *py("print('ok')"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        records = evidence.load_records(self.repo)
+        self.assertEqual(records[-1]["cwd"], "pkg/sub")
 
 
 if __name__ == "__main__":

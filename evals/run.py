@@ -5,9 +5,10 @@ agent CLI, then grades the workspace and transcript with `cases/<name>/grade.py`
 
 - claude: `claude -p --plugin-dir <plugin>`; follow-up turns use `--continue`.
 - codex:  `codex exec --json` in the default workspace-write sandbox; follow-up
-  turns resume the thread. Uses the CODEX_HOME from the environment (set it to a
-  dedicated eval home holding only model/auth settings). The plugin is reinstalled
-  from this working tree before the run, because Codex loads it from its cache.
+  turns resume the thread. Uses a dedicated CODEX_HOME from the environment
+  (holding only model/auth settings) so the user's default ~/.codex plugin setup
+  is not modified. The plugin is reinstalled from this working tree before the
+  run, because Codex loads it from its cache.
 
 Examples:
     python -X utf8 evals/run.py                     # all cases, with plugin
@@ -36,7 +37,7 @@ from pathlib import Path
 EVALS = Path(__file__).resolve().parent
 ROOT = EVALS.parent / "plugins/dev-flow"
 sys.path.insert(0, str(EVALS))
-from lib import FIXTURES, Context  # noqa: E402
+from lib import FIXTURES, Context, execution_checks, is_review_request  # noqa: E402
 
 
 def load_cases(names=None):
@@ -86,6 +87,21 @@ def find_exe(name):
 CODEX_PLUGIN = "dev-flow@dev-flow"
 
 
+def ensure_isolated_codex_home(allow_default=False):
+    """Refuse to reinstall/uninstall plugins in the user's default ~/.codex unless explicitly allowed."""
+    if allow_default:
+        return
+    env_home = os.environ.get("CODEX_HOME", "").strip()
+    default_home = (Path.home() / ".codex").resolve()
+    if not env_home or Path(env_home).expanduser().resolve() == default_home:
+        sys.exit(
+            "安全保护：--agent codex 会卸载/重装 dev-flow@dev-flow 插件缓存。\n"
+            "请先将 CODEX_HOME 指向专用评测目录（避免改动你的默认 ~/.codex 配置），\n"
+            "例如：CODEX_HOME=/tmp/codex-eval python3 evals/run.py --agent codex\n"
+            "如确认要在默认目录运行，请显式传入 --allow-default-codex-home。"
+        )
+
+
 def install_codex_plugin(enabled=True):
     """Refresh Codex's cached copy of the plugin from this working tree, or uninstall it for a baseline.
 
@@ -126,24 +142,110 @@ def thread_id(text):
 COLLAB_TOOLS = {"spawn_agent", "followup_task", "wait_agent"}
 
 
+def _extract_agent_id(output_text):
+    try:
+        data = json.loads(output_text)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(data, dict):
+        aid = data.get("agent_id") or data.get("id")
+        return str(aid) if aid else None
+    return None
+
+
+def _is_completed_agent_state(state):
+    if isinstance(state, str):
+        return state.strip().lower() == "completed"
+    if isinstance(state, dict):
+        if isinstance(state.get("completed"), str) and state["completed"].strip():
+            return True
+        status_val = state.get("status") or state.get("state")
+        if isinstance(status_val, str) and status_val.strip().lower() == "completed":
+            return True
+    return False
+
+
+def _analyze_collab_output(tool_name, output_text):
+    """Return (output_present, output_error, completed_agents) for a collaboration tool output."""
+    text = (output_text or "").strip()
+    if not text:
+        return False, True, []
+    if tool_name != "wait_agent":
+        lowered = text.lower()
+        is_err = any(m in lowered for m in ("error:", '"error"', "failed"))
+        return True, is_err, []
+
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        if parsed.get("timed_out") is True or parsed.get("error") or parsed.get("errored"):
+            return True, True, []
+        status = parsed.get("status")
+        if isinstance(status, dict):
+            completed = [str(aid) for aid, st in status.items() if _is_completed_agent_state(st)]
+            if not completed:
+                return True, True, []
+            return True, False, completed
+        if isinstance(status, str):
+            return True, status.strip().lower() != "completed", []
+        state = parsed.get("state")
+        if isinstance(state, str):
+            return True, state.strip().lower() != "completed", []
+        return True, True, []
+
+    return True, True, []
+
+
 def codex_collab_calls(thread):
-    """`codex exec --json` does not emit collaboration tool calls; read them from the session rollout."""
+    """`codex exec --json` does not emit collaboration tool calls; read them and their outputs from rollout."""
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     calls = []
+    outputs = {}
+    raw_items = []
     for path in sorted((home / "sessions").rglob(f"rollout-*{thread}.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 payload = json.loads(line).get("payload") or {}
             except ValueError:
                 continue
-            if payload.get("type") == "function_call" and payload.get("name") in COLLAB_TOOLS:
-                try:
-                    arguments = json.loads(payload.get("arguments") or "{}")
-                except ValueError:
-                    arguments = {}
-                arguments.pop("message", None)  # stored encrypted; not useful for grading
-                calls.append({"type": "item.completed", "source": "rollout", "item": {
-                    "type": "collab_tool_call", "tool": payload["name"], "arguments": arguments}})
+            ptype = payload.get("type")
+            if ptype == "function_call_output" and payload.get("call_id"):
+                out_val = payload.get("output")
+                outputs[payload["call_id"]] = out_val if isinstance(out_val, str) else json.dumps(out_val, ensure_ascii=False)
+            elif ptype == "function_call" and payload.get("name") in COLLAB_TOOLS:
+                raw_items.append(payload)
+
+    for payload in raw_items:
+        try:
+            arguments = json.loads(payload.get("arguments") or "{}")
+        except ValueError:
+            arguments = {}
+        reviewer = is_review_request(arguments)
+        arguments.pop("message", None)  # stored encrypted; not useful for grading
+        call_id = payload.get("call_id")
+        tool_name = payload["name"]
+        item = {"type": "collab_tool_call", "tool": tool_name, "arguments": arguments, "reviewer": reviewer}
+        if call_id:
+            item["call_id"] = call_id
+            if call_id in outputs:
+                text = outputs[call_id]
+                present, is_err, completed = _analyze_collab_output(tool_name, text)
+                item["output_present"] = present
+                item["output_error"] = is_err
+                item["output_preview"] = text.strip()[:200]
+                if tool_name == "wait_agent":
+                    item["completed_agents"] = completed
+                elif tool_name == "spawn_agent":
+                    aid = _extract_agent_id(text)
+                    if aid:
+                        item["agent_id"] = aid
+            else:
+                item["output_present"] = False
+                item["output_error"] = True
+        calls.append({"type": "item.completed", "source": "rollout", "item": item})
     return calls
 
 
@@ -173,13 +275,14 @@ def kill_tree(proc):
         os.killpg(proc.pid, signal.SIGKILL)
 
 
-def run_turn(command, cwd, prompt, timeout, grace=GRACE):
-    """Run one agent turn; return (stdout, stderr-or-note).
+def run_turn_detailed(command, cwd, prompt, timeout, grace=GRACE):
+    """Run one agent turn; return (stdout, stderr-or-note, status_dict).
 
     The process tree is killed on timeout, or shortly after the end-of-turn event if the
     CLI keeps running: a plain subprocess timeout only kills the direct child and then
     blocks on pipes still held by grandchildren.
     """
+    started = time.time()
     group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
              else {"start_new_session": True})
     proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -200,14 +303,17 @@ def run_turn(command, cwd, prompt, timeout, grace=GRACE):
     proc.stdin.close()
 
     deadline, note = time.time() + timeout, ""
+    timed_out, killed_after_done = False, False
     while proc.poll() is None:
         if time.time() > deadline:
             note = f"timeout after {timeout}s"
+            timed_out = True
         elif done.wait(1) and proc.poll() is None:
             try:
                 proc.wait(grace)
             except subprocess.TimeoutExpired:
                 note = f"still running {grace}s after the turn ended; killed"
+                killed_after_done = True
         if note:
             kill_tree(proc)
             break
@@ -216,7 +322,23 @@ def run_turn(command, cwd, prompt, timeout, grace=GRACE):
     for pipe in (proc.stdout, proc.stderr):
         pipe.close()
     proc.wait(10)
-    return "".join(out), "\n".join(filter(None, ["".join(err).strip(), note]))
+    info = {
+        "started": True,
+        "skipped": False,
+        "exit_code": proc.returncode,
+        "timed_out": timed_out,
+        "killed_after_done": killed_after_done,
+        "has_end_event": done.is_set(),
+        "seconds": round(time.time() - started, 2),
+        "error": note,
+    }
+    return "".join(out), "\n".join(filter(None, ["".join(err).strip(), note])), info
+
+
+def run_turn(command, cwd, prompt, timeout, grace=GRACE):
+    """Backward-compatible wrapper returning (stdout, stderr-or-note)."""
+    out, err, _ = run_turn_detailed(command, cwd, prompt, timeout, grace=grace)
+    return out, err
 
 
 def run_case(name, case, out, args):
@@ -224,21 +346,44 @@ def run_case(name, case, out, args):
     ws = case_dir / "workspace"
     case_dir.mkdir(parents=True)
     base = prepare(case["fixture"], ws)
-    transcripts, snapshots = [], []
-    stats = {"cost_usd": 0.0, "agent_turns": 0, "seconds": 0.0, "tokens": 0}
+    transcripts, snapshots, turns_meta = [], [], []
+    stats = {
+        "cost_usd": None,
+        "agent_turns": 0,
+        "seconds": 0.0,
+        "tokens": None,
+        "input_tokens": None,
+        "cached_input_tokens": None,
+        "output_tokens": None,
+        "usage_present": False,
+    }
     thread, collab_seen = None, 0
     for index, prompt in enumerate(case["turns"]):
         start = time.time()
         if args.agent == "codex":
             if index > 0 and not thread:
-                break  # first turn never started a thread; nothing to resume
+                turns_meta.append({
+                    "index": index + 1, "started": False, "skipped": True,
+                    "exit_code": None, "timed_out": False, "killed_after_done": False,
+                    "has_end_event": False, "seconds": 0.0,
+                    "error": "previous turn did not start a thread",
+                })
+                continue
             command = codex_command(args, thread if index > 0 else None)
         else:
             command = agent_command(args, index)
         try:
-            text, err = run_turn(command, ws, prompt, args.timeout)
+            text, err, info = run_turn_detailed(command, ws, prompt, args.timeout)
         except OSError as exc:
             text, err = "", f"failed to start: {exc}"
+            info = {
+                "started": False, "skipped": False, "exit_code": None,
+                "timed_out": False, "killed_after_done": False,
+                "has_end_event": False, "seconds": round(time.time() - start, 2),
+                "error": err,
+            }
+        info["index"] = index + 1
+        turns_meta.append(info)
         stats["seconds"] += time.time() - start
         thread = thread or (thread_id(text) if args.agent == "codex" else None)
         if thread:
@@ -254,55 +399,140 @@ def run_case(name, case, out, args):
             except ValueError:
                 continue
             if isinstance(event, dict) and event.get("type") == "result":
-                stats["cost_usd"] += event.get("total_cost_usd") or 0
+                cost = event.get("total_cost_usd")
+                if cost is not None:
+                    stats["cost_usd"] = (stats["cost_usd"] or 0.0) + cost
+                    stats["usage_present"] = True
                 stats["agent_turns"] += event.get("num_turns") or 0
             elif isinstance(event, dict) and event.get("type") == "turn.completed":  # codex
                 usage = event.get("usage") or {}
-                stats["tokens"] += (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+                in_tok = usage.get("input_tokens")
+                cached_tok = usage.get("cached_input_tokens")
+                out_tok = usage.get("output_tokens")
+                if in_tok is not None or out_tok is not None:
+                    stats["usage_present"] = True
+                    stats["input_tokens"] = (stats["input_tokens"] or 0) + (in_tok or 0)
+                    stats["output_tokens"] = (stats["output_tokens"] or 0) + (out_tok or 0)
+                    stats["tokens"] = (stats["tokens"] or 0) + (in_tok or 0) + (out_tok or 0)
+                if cached_tok is not None:
+                    stats["cached_input_tokens"] = (stats["cached_input_tokens"] or 0) + cached_tok
                 stats["agent_turns"] += 1
         transcripts.append(text)
         snapshots.append(snapshot(ws))
-    meta = {"case": name, "fixture": case["fixture"], "base": base, "snapshots": snapshots,
-            "stats": stats, "plugin": not args.no_plugin, "model": args.model, "agent": args.agent}
+    meta = {
+        "case": name, "fixture": case["fixture"], "base": base, "snapshots": snapshots,
+        "expected_turns": len(case["turns"]), "turns": turns_meta,
+        "stats": stats, "plugin": not args.no_plugin, "model": args.model, "agent": args.agent,
+    }
     (case_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return grade_case(case_dir)
+
+
+def _dimension_ratio(checks):
+    return f"{sum(c['ok'] for c in checks)}/{len(checks)}"
 
 
 def grade_case(case_dir):
     meta = json.loads((case_dir / "meta.json").read_text(encoding="utf-8"))
     turns = sorted(case_dir.glob("turn*.jsonl"), key=lambda p: int(p.stem[4:]))
-    ctx = Context(ws=case_dir / "workspace", fixture=FIXTURES / meta["fixture"], base=meta["base"],
-                  transcripts=[p.read_text(encoding="utf-8") for p in turns], snapshots=meta["snapshots"])
+    stderrs = []
+    for idx in range(max(len(turns), meta.get("expected_turns") or 0)):
+        stderr_file = case_dir / f"turn{idx + 1}.stderr.txt"
+        stderrs.append(stderr_file.read_text(encoding="utf-8", errors="replace") if stderr_file.is_file() else "")
+    case_spec_path = EVALS / "cases" / meta["case"] / "case.json"
+    expected_turns = meta.get("expected_turns")
+    if not expected_turns and case_spec_path.is_file():
+        expected_turns = len(json.loads(case_spec_path.read_text(encoding="utf-8")).get("turns") or [])
+    plugin = meta.get("plugin", True)
+    ctx = Context(
+        ws=case_dir / "workspace",
+        fixture=FIXTURES / meta["fixture"],
+        base=meta["base"],
+        transcripts=[p.read_text(encoding="utf-8") for p in turns],
+        snapshots=meta["snapshots"],
+        plugin=plugin,
+        turns_meta=meta.get("turns") or [],
+        stderrs=stderrs,
+        expected_turns=expected_turns or len(turns),
+    )
+    exec_checks = [c.to_dict() for c in execution_checks(ctx)]
     try:
-        checks = [c.to_dict() for c in load_grader(meta["case"])(ctx)]
+        case_checks = [c.to_dict() for c in load_grader(meta["case"])(ctx)]
     except Exception as exc:  # grader crash is a failure, not a runner crash
-        checks = [{"name": "grader 运行", "ok": False, "detail": repr(exc), "required": True}]
+        case_checks = [{"name": "grader 运行", "ok": False, "detail": repr(exc),
+                        "required": True, "category": "execution", "status": "fail"}]
+    checks = exec_checks + case_checks
     commands, failed = ctx.command_stats()
+
+    execution = [c for c in checks if c.get("category") == "execution"]
+    functional = [c for c in checks if c.get("category") == "functional" and c["required"]]
+    compliance_all = [c for c in checks if c.get("category") == "compliance"]
+    compliance_req = [c for c in compliance_all if c["required"]]
     required = [c for c in checks if c["required"]]
     soft = [c for c in checks if not c["required"]]
+
+    execution_passed = all(c["ok"] for c in execution)
+    functional_passed = all(c["ok"] for c in functional)
+    compliance_passed = all(c["ok"] for c in compliance_req) if plugin else None
+    overall_passed = execution_passed and functional_passed and (compliance_passed if plugin else True)
+
     result = {
-        "case": meta["case"], "passed": all(c["ok"] for c in required),
-        "required": f"{sum(c['ok'] for c in required)}/{len(required)}",
-        "soft": f"{sum(c['ok'] for c in soft)}/{len(soft)}",
-        "stats": {**meta["stats"], "commands": commands, "failed_commands": failed}, "checks": checks,
+        "case": meta["case"],
+        "plugin": plugin,
+        "passed": overall_passed,
+        "delivery_passed": execution_passed and functional_passed,
+        "dimensions": {
+            "execution": {"passed": execution_passed, "score": _dimension_ratio(execution)},
+            "functional": {"passed": functional_passed, "score": _dimension_ratio(functional)},
+            "compliance": {
+                "passed": compliance_passed,
+                "score": _dimension_ratio(compliance_req if plugin else compliance_all),
+            },
+        },
+        "required": _dimension_ratio(required),
+        "soft": _dimension_ratio(soft),
+        "stats": {**meta["stats"], "commands": commands, "failed_commands": failed},
+        "checks": checks,
     }
     (case_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
 
 
+def _fmt_num(val, fmt="{:.2f}"):
+    return "-" if val is None else fmt.format(val)
+
+
 def summarize(results, out):
-    lines = ["| 用例 | 结果 | 必需 | 参考 | 耗时(s) | 命令 | 失败命令 | 成本($) | tokens |",
-             "|---|---|---|---|---|---|---|---|---|"]
+    lines = [
+        "| 用例 | 综合 | 交付 | 执行 | 功能 | 合规 | 参考 | 耗时(s) | 命令 | 失败命令 | 成本($) | tokens(缓存) |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
     for r in results:
         s = r["stats"]
-        lines.append(f"| {r['case']} | {'✅' if r['passed'] else '❌'} | {r['required']} | {r['soft']} "
-                     f"| {s['seconds']:.0f} | {s.get('commands', 0)} | {s.get('failed_commands', 0)} "
-                     f"| {s['cost_usd']:.2f} | {s.get('tokens', 0)} |")
+        dims = r["dimensions"]
+        delivery = r.get("delivery_passed", dims["execution"]["passed"] and dims["functional"]["passed"])
+        exec_cell = f"{'✅' if dims['execution']['passed'] else '❌'} {dims['execution']['score']}"
+        func_cell = f"{'✅' if dims['functional']['passed'] else '❌'} {dims['functional']['score']}"
+        if dims["compliance"]["passed"] is None:
+            comp_cell = f"➖ {dims['compliance']['score']}"
+        else:
+            comp_cell = f"{'✅' if dims['compliance']['passed'] else '❌'} {dims['compliance']['score']}"
+        tok = s.get("tokens")
+        cached = s.get("cached_input_tokens")
+        tok_cell = "-" if tok is None else (f"{tok}({cached})" if cached is not None else str(tok))
+        lines.append(
+            f"| {r['case']} | {'✅' if r['passed'] else '❌'} | {'✅' if delivery else '❌'} | {exec_cell} | {func_cell} | {comp_cell} "
+            f"| {r['soft']} | {s['seconds']:.0f} | {s.get('commands', 0)} | {s.get('failed_commands', 0)} "
+            f"| {_fmt_num(s.get('cost_usd'))} | {tok_cell} |"
+        )
     lines.append("")
     for r in results:
         for c in r["checks"]:
             if not c["ok"]:
-                tag = "必需" if c["required"] else "参考"
+                if c.get("status") == "unknown":
+                    tag = f"{c.get('category', 'check')}/无法确认"
+                else:
+                    tag = f"{c.get('category', 'check')}/{'必需' if c['required'] else '参考'}"
                 lines.append(f"- {r['case']} [{tag}] {c['name']}：{c['detail']}")
     text = "\n".join(lines)
     (out / "summary.md").write_text(text + "\n", encoding="utf-8")
@@ -320,6 +550,8 @@ def main():
     parser.add_argument("--timeout", type=int, default=1800, help="每轮超时秒数")
     parser.add_argument("--out", type=Path, help="结果目录，默认在系统临时目录")
     parser.add_argument("--grade-only", type=Path, help="对已有结果目录重新评分")
+    parser.add_argument("--allow-default-codex-home", action="store_true",
+                        help="允许直接修改默认 ~/.codex 插件缓存（不推荐，建议改设 CODEX_HOME）")
     args = parser.parse_args()
 
     if args.grade_only:
@@ -328,6 +560,7 @@ def main():
         return
 
     if args.agent == "codex":
+        ensure_isolated_codex_home(allow_default=args.allow_default_codex_home)
         install_codex_plugin(enabled=not args.no_plugin)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{args.agent}" + ("-noplugin" if args.no_plugin else "")
     out = args.out or Path(tempfile.gettempdir()) / "dev-flow-evals" / stamp

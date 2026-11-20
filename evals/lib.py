@@ -1,21 +1,31 @@
 """Shared helpers for eval graders.
 
 A grader is `cases/<name>/grade.py` exposing `grade(ctx) -> list[Check]`.
-A case passes when every check with `required=True` passes; soft checks are
-reported for trend tracking only.
+Checks are grouped into dimensions:
+- execution:  runner/turn health (no timeout, startup failure, or missing end event)
+- functional: user-visible task correctness and compatibility (shared across plugin & --no-plugin)
+- compliance: dev-flow protocol adherence (required when plugin=True, observed when --no-plugin)
+- advisory:   soft trend/style signals (never gate pass/fail)
 """
 
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 EVALS = Path(__file__).resolve().parent
 FIXTURES = EVALS / "fixtures"
+EVIDENCE_CLI = EVALS.parent / "plugins" / "dev-flow" / "skills" / "df-verify" / "scripts" / "evidence.py"
 CODE_SUFFIXES = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".cs", ".rb", ".kt", ".swift", ".c", ".cpp"}
+
+PYTHON_EXE = re.compile(r"(?:python(?:3(?:\.\d+)*)?|py)(?:\.exe)?$", re.I)
+REVIEW_ROLE = re.compile(r"(?:^|[:/_-])(?:df[-_]reviewer|df[-_]review|reviewer|review)(?:$|[/_-])", re.I)
 
 
 @dataclass
@@ -24,12 +34,156 @@ class Check:
     ok: bool
     detail: str = ""
     required: bool = True
+    category: str = "functional"
+    status: str = ""
+
+    def __post_init__(self):
+        if self.status == "unknown":
+            self.ok = False
+        elif not self.status:
+            self.status = "pass" if self.ok else "fail"
 
     def to_dict(self):
         return asdict(self)
 
 
 SKILL_READ = re.compile(r"(df-[a-z]+)[/\\]+SKILL\.md")
+
+
+def output_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(item.get("text", "") for item in content if isinstance(item, dict))
+    return json.dumps(content, ensure_ascii=False) if content is not None else ""
+
+
+def program_name(program):
+    return program.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def python_args(argv):
+    if not argv or not PYTHON_EXE.fullmatch(program_name(argv[0])):
+        return None
+    args = argv[1:]
+    while args:
+        if args[0] in ("-X", "-W") and len(args) > 1:
+            args = args[2:]
+        elif args[0] in ("-u", "-B", "-E", "-I", "-s", "-S", "-O", "-OO", "-q") or re.fullmatch(r"-3(?:\.\d+)?", args[0]):
+            args = args[1:]
+        else:
+            break
+    return args
+
+
+def command_argvs(command):
+    """Recognize direct commands, shell wrappers and evidence wrappers; retain only a successful final chain."""
+    aliases = {}
+    if isinstance(command, list):
+        groups = [command]
+    elif isinstance(command, str):
+        aliases = {name: value for name, _, value in re.findall(r"\b([A-Za-z_]\w*)=(['\"])(.*?)\2", command)}
+        lexer = shlex.shlex(command.strip(), posix=False, punctuation_chars=";&|<>\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        try:
+            words = list(lexer)
+        except ValueError:
+            return []
+        if "<<" in words or "<<-" in words:
+            return []
+        groups, current = [], []
+        for word in words:
+            if word in ("&&", ";", "||", "|", "\n", "&"):
+                if current:
+                    groups.append(current)
+                if word != "&&":
+                    groups = []
+                current = []
+            else:
+                current.append(word[1:-1] if len(word) > 1 and word[0] == word[-1] and word[0] in "'\"" else word)
+        if current:
+            groups.append(current)
+    else:
+        return []
+
+    result = []
+    for argv in groups:
+        while argv and ("=" in argv[0] or argv[0] == "env"):
+            argv = argv[1:]
+        if not argv:
+            continue
+        alias = aliases.get(argv[0].strip("${}")) if argv[0].startswith("$") else None
+        if alias:
+            prefixes = command_argvs(alias)
+            if len(prefixes) == 1:
+                argv = [*prefixes[0], *argv[1:]]
+        name = program_name(argv[0])
+        if name in ("bash", "sh", "pwsh", "pwsh.exe", "powershell", "powershell.exe", "cmd", "cmd.exe"):
+            flag = next((index for index, arg in enumerate(argv)
+                         if arg.lower() in ("-c", "-lc", "-command", "/c")), None)
+            if flag is not None and flag + 1 < len(argv):
+                result.extend(command_argvs(" ".join(argv[flag + 1:])))
+            continue
+        result.append(argv)
+        args = python_args(argv)
+        if args and program_name(args[0]) == "evidence.py" and args[1:2] == ["run"] and "--" in args:
+            result.extend(command_argvs(args[args.index("--") + 1:]))
+    return result
+
+
+def is_test_command(command):
+    for argv in command_argvs(command):
+        args = python_args(argv)
+        test_args = args[2:] if args and args[:2] in (["-m", "unittest"], ["-m", "pytest"]) else None
+        if program_name(argv[0]) in ("pytest", "pytest.exe", "py.test"):
+            test_args = argv[1:]
+        if test_args is not None and not any(arg in test_args for arg in
+                                              ("--help", "-h", "--version", "--collect-only", "--co")):
+            return True
+    return False
+
+
+def invokes_python_module(command, module, *arguments):
+    return any(args and args[:2] == ["-m", module] and args[2:2 + len(arguments)] == list(arguments)
+               for args in (python_args(argv) for argv in command_argvs(command)))
+
+
+def is_evidence_call(command, subcommand):
+    return any(args and program_name(args[0]) == "evidence.py" and args[1:2] == [subcommand]
+               for args in (python_args(argv) for argv in command_argvs(command)))
+
+
+def execution_succeeded(execution):
+    return execution.get("output_present") is True and execution.get("exit_code") == 0 and execution.get("is_error") is False
+
+
+def is_review_request(data):
+    if data.get("reviewer") is True:
+        return True
+    return any(REVIEW_ROLE.search(str(data.get(key) or "")) for key in ("subagent_type", "agent_type", "task_name"))
+
+
+def background_agent_id(output):
+    try:
+        parsed = json.loads(output)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed.get("agent_id") or parsed.get("task_id") or parsed.get("agentId")
+    match = re.search(r"(?:agentId|agent_id|task_id)\s*[:=]\s*([\w-]+)", output)
+    return match.group(1) if match else None
+
+
+def task_completed(output):
+    try:
+        parsed = json.loads(output)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed.get("status") == "completed" and not parsed.get("error")
+    return "<status>completed</status>" in output
 
 
 def codex_tool_uses(item):
@@ -39,13 +193,21 @@ def codex_tool_uses(item):
         command = item.get("command") or ""
         for skill in dict.fromkeys(SKILL_READ.findall(command)):
             yield "Skill", {"skill": f"dev-flow:{skill}"}
-        yield "Bash", {"command": command, "exit_code": item.get("exit_code")}
+        code = item.get("exit_code")
+        yield "Bash", {"command": command, "exit_code": code, "output_present": code is not None,
+                       "output_error": None if code is None else code != 0,
+                       "output": item.get("aggregated_output") or ""}
     elif kind == "file_change":
         for change in item.get("changes") or []:
             yield "Edit", {"file_path": change.get("path", ""), "kind": change.get("kind")}
     elif item.get("tool"):  # mcp / collaboration tools such as spawn_agent
         data = item.get("arguments")
-        yield item["tool"], data if isinstance(data, dict) else {k: v for k, v in item.items() if k != "result"}
+        payload = dict(data) if isinstance(data, dict) else {k: v for k, v in item.items() if k != "result"}
+        for extra in ("call_id", "output_present", "output_error", "output_preview", "completed_agents", "agent_id", "reviewer"):
+            payload.pop(extra, None)
+            if extra in item:
+                payload[extra] = item[extra]
+        yield item["tool"], payload
 
 
 @dataclass
@@ -55,6 +217,10 @@ class Context:
     base: str
     transcripts: list = field(default_factory=list)  # raw stream-json text per turn
     snapshots: list = field(default_factory=list)    # sorted file lists after each turn
+    plugin: bool = True
+    turns_meta: list = field(default_factory=list)   # per-turn execution metadata from run.py
+    stderrs: list = field(default_factory=list)      # per-turn stderr/notes text
+    expected_turns: int = 0
 
     # ---- transcript ----
     def events(self, turn=None):
@@ -70,13 +236,38 @@ class Context:
 
     def tool_uses(self, turn=None):
         """(name, input) pairs in Claude Code's vocabulary; Codex events are translated."""
-        for event in self.events(turn):
-            if event.get("type") == "assistant":  # claude stream-json
-                for item in event.get("message", {}).get("content", []) or []:
-                    if isinstance(item, dict) and item.get("type") == "tool_use":
-                        yield item.get("name", ""), item.get("input", {}) or {}
-            elif event.get("type") == "item.completed":  # codex exec --json
-                yield from codex_tool_uses(event.get("item") or {})
+        for index in range(len(self.transcripts)) if turn is None else [turn]:
+            events = list(self.events(index))
+            results = {item.get("tool_use_id"): item for event in events if event.get("type") == "user"
+                       for item in event.get("message", {}).get("content", []) or []
+                       if isinstance(item, dict) and item.get("type") == "tool_result"}
+            for event in events:
+                if event.get("type") == "assistant":
+                    for item in event.get("message", {}).get("content", []) or []:
+                        if not isinstance(item, dict) or item.get("type") != "tool_use":
+                            continue
+                        data = dict(item.get("input") or {})
+                        result = results.get(item.get("id"))
+                        present = result is not None
+                        data["output_present"] = present
+                        data["output_error"] = bool(result.get("is_error")) if present else None
+                        data["output"] = output_text(result.get("content")) if present else ""
+                        data["output_preview"] = data["output"][:200]
+                        data["call_id"] = item.get("id")
+                        if item.get("name") in ("Bash", "PowerShell"):
+                            code = 1 if data["output_error"] else 0
+                            background = data.get("run_in_background") or data["output"].lstrip().startswith("Command running in background")
+                            data["exit_code"] = code if present and not background else None
+                        yield item.get("name", ""), data
+                elif event.get("type") == "item.completed":
+                    yield from codex_tool_uses(event.get("item") or {})
+
+    def shell_executions(self, turn=None):
+        """Shell commands paired with outcome (`exit_code` / `is_error`) and tool index."""
+        return [{"command": data.get("command", ""), "exit_code": data.get("exit_code"),
+                 "is_error": data.get("output_error"), "output_present": data.get("output_present", False),
+                 "output": data.get("output", ""), "tool_index": index}
+                for index, (name, data) in enumerate(self.tool_uses(turn)) if name in ("Bash", "PowerShell")]
 
     def bash_commands(self, turn=None):
         return [i.get("command", "") for n, i in self.tool_uses(turn) if n in ("Bash", "PowerShell")]
@@ -127,9 +318,47 @@ class Context:
                 result = event["item"].get("text") or ""  # codex: last agent message of the turn
         return result
 
+    def has_end_event(self, turn):
+        for event in self.events(turn):
+            if event.get("type") in ("turn.completed", "result"):
+                return True
+        return False
+
+    def turn_end_error(self, turn):
+        """Return an error reason when a turn ended with an error event (e.g. Claude error_max_turns)."""
+        if turn >= len(self.transcripts):
+            return None
+        last_error = None
+        completed_ok = False
+        for event in self.events(turn):
+            etype = event.get("type")
+            if etype == "result":
+                subtype = str(event.get("subtype") or "")
+                if event.get("is_error") is True or subtype.startswith("error"):
+                    last_error = subtype or str(event.get("result") or "result.is_error")[:80]
+                    completed_ok = False
+                else:
+                    completed_ok = True
+                    last_error = None
+            elif etype == "turn.failed":
+                err = event.get("error")
+                if isinstance(err, dict):
+                    last_error = str(err.get("message") or err.get("code") or "turn.failed")[:80]
+                else:
+                    last_error = str(err or "turn.failed")[:80]
+                completed_ok = False
+            elif etype == "turn.completed":
+                completed_ok = True
+                last_error = None
+        return None if completed_ok else last_error
+
     def ran(self, pattern, turn=None):
         regex = re.compile(pattern)
         return [c for c in self.bash_commands(turn) if regex.search(c)]
+
+    def ran_executions(self, pattern, turn=None):
+        regex = re.compile(pattern)
+        return [e for e in self.shell_executions(turn) if regex.search(e["command"])]
 
     def first_index(self, predicate, turn=None):
         for index, (name, data) in enumerate(self.tool_uses(turn)):
@@ -141,11 +370,27 @@ class Context:
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.ws, capture_output=True, text=True, encoding="utf-8")
 
+    def git_bytes(self, *args):
+        return subprocess.run(["git", *args], cwd=self.ws, capture_output=True)
+
     def changed_files(self):
-        committed = self.git("diff", "--name-only", self.base).stdout.split()
-        status = self.git("status", "--porcelain", "--untracked-files=all").stdout.splitlines()
-        current = [line[3:].strip().strip('"') for line in status if line.strip()]
-        return sorted(f for f in set(committed) | set(current) if "__pycache__/" not in f)  # interpreter byproducts
+        if not self.base or not (self.ws / ".git").exists():
+            return []
+        committed_raw = self.git_bytes("diff", "--name-only", "-z", self.base).stdout
+        committed = [p.decode("utf-8", "replace") for p in committed_raw.split(b"\0") if p]
+        status_raw = self.git_bytes("status", "--porcelain", "-z", "--untracked-files=all").stdout
+        entries = [e for e in status_raw.split(b"\0") if e]
+        current = []
+        i = 0
+        while i < len(entries):
+            entry = entries[i].decode("utf-8", "replace")
+            if len(entry) >= 3:
+                code, path_str = entry[:2], entry[3:]
+                current.append(path_str)
+                if "R" in code or "C" in code:
+                    i += 1
+            i += 1
+        return sorted(f for f in set(committed) | set(current) if "__pycache__/" not in f)
 
     def new_commits(self):
         out = self.git("rev-list", f"{self.base}..HEAD").stdout.split()
@@ -159,21 +404,113 @@ class Context:
     def python(self, *args, **kwargs):
         return self.run([sys.executable, *args], **kwargs)
 
+    def evidence_report(self):
+        """Run evidence.py report --json against this workspace when .dev-flow/ exists."""
+        if not (self.ws / ".dev-flow").is_dir() or not EVIDENCE_CLI.is_file():
+            return None
+        proc = self.python(str(EVIDENCE_CLI), "report", "--json")
+        if proc.returncode != 0:
+            return None
+        try:
+            return json.loads(proc.stdout)
+        except ValueError:
+            return None
+
+    def evidence_records(self):
+        path = self.ws / ".dev-flow" / "evidence.jsonl"
+        if not path.is_file():
+            return []
+        records = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+        return records
+
 
 # ---- reusable checks ----
 
+def execution_checks(ctx):
+    """Verify runner-level execution integrity (no timeout, startup failure, or missing turn end)."""
+    expected = ctx.expected_turns or len(ctx.transcripts) or 1
+    turns_meta = list(ctx.turns_meta)
+    issues = []
+
+    if len(ctx.transcripts) < expected:
+        issues.append(f"预期 {expected} 轮，仅产出 {len(ctx.transcripts)} 轮")
+
+    for idx in range(expected):
+        meta = turns_meta[idx] if idx < len(turns_meta) else {}
+        stderr = ctx.stderrs[idx] if idx < len(ctx.stderrs) else ""
+        if meta.get("skipped"):
+            issues.append(f"第 {idx + 1} 轮被跳过（{meta.get('error') or '前序失败'}）")
+            continue
+        if meta.get("started") is False or "failed to start:" in stderr:
+            issues.append(f"第 {idx + 1} 轮启动失败（{meta.get('error') or stderr.splitlines()[-1]}）")
+            continue
+        if meta.get("timed_out") or "timeout after" in stderr:
+            issues.append(f"第 {idx + 1} 轮超时")
+            continue
+        has_end = meta.get("has_end_event")
+        if has_end is None:
+            has_end = ctx.has_end_event(idx) if idx < len(ctx.transcripts) else False
+        end_error = ctx.turn_end_error(idx)
+        if end_error:
+            issues.append(f"第 {idx + 1} 轮异常结束（{end_error}）")
+            continue
+        if not has_end:
+            issues.append(f"第 {idx + 1} 轮缺少结束事件（turn.completed/result）")
+            continue
+        exit_code = meta.get("exit_code")
+        if exit_code not in (0, None) and not meta.get("killed_after_done"):
+            issues.append(f"第 {idx + 1} 轮异常退出（exit={exit_code}）")
+
+    return [
+        Check("执行完整（无超时、启动失败或缺失结束事件）", not issues,
+              "; ".join(issues) if issues else f"全部 {expected} 轮正常结束",
+              required=True, category="execution"),
+    ]
+
+
 def no_commits(ctx):
     count = ctx.new_commits()
-    return Check("未擅自提交", count == 0, f"新提交数 {count}")
+    return Check("未擅自提交", count == 0, f"新提交数 {count}", category="functional")
 
 
 def unit_tests_pass(ctx):
     proc = ctx.python("-m", "unittest", "discover", "-s", "tests")
     tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
-    return Check("项目测试通过", proc.returncode == 0, f"exit={proc.returncode} {' | '.join(tail)}")
+    return Check("项目测试通过", proc.returncode == 0, f"exit={proc.returncode} {' | '.join(tail)}",
+                 category="functional")
 
 
-def original_asserts_intact(ctx, rel_dir="tests"):
+def original_tests_pass(ctx, rel_dir="tests"):
+    """Run an immutable copy of the original fixture tests against the agent's modified code."""
+    src_tests = ctx.fixture / rel_dir
+    if not src_tests.is_dir():
+        return Check("原始夹具测试兼容通过", True, "无原始测试目录", category="functional")
+    with tempfile.TemporaryDirectory() as tmp:
+        copied = Path(tmp) / rel_dir
+        shutil.copytree(src_tests, copied, ignore=shutil.ignore_patterns("__pycache__"))
+        env = {"PYTHONPATH": str(ctx.ws)}
+        proc = ctx.python("-m", "unittest", "discover", "-s", str(copied), env=env)
+    output = (proc.stdout + proc.stderr).strip()
+    ran_match = re.search(r"Ran (\d+) test", output)
+    ran_count = int(ran_match.group(1)) if ran_match else 0
+    skip_match = re.search(r"skipped=(\d+)", output)
+    skipped_count = int(skip_match.group(1)) if skip_match else 0
+    executed_count = ran_count - skipped_count
+    ok = proc.returncode == 0 and executed_count > 0
+    tail = output.splitlines()[-3:]
+    return Check("原始夹具测试兼容通过", ok,
+                 f"exit={proc.returncode} ran={ran_count} skipped={skipped_count} {' | '.join(tail)}",
+                 required=True, category="functional")
+
+
+def original_asserts_intact(ctx, rel_dir="tests", required=False):
     missing = []
     for original in (ctx.fixture / rel_dir).rglob("*.py"):
         target = ctx.ws / original.relative_to(ctx.fixture)
@@ -182,7 +519,8 @@ def original_asserts_intact(ctx, rel_dir="tests"):
         for line in original.read_text(encoding="utf-8").splitlines():
             if "assert" in line and line.strip() not in current_lines:
                 missing.append(f"{original.name}: {line.strip()}")
-    return Check("原有断言未被删改", not missing, "; ".join(missing[:3]))
+    return Check("原有断言行未改动", not missing, "; ".join(missing[:3]),
+                 required=required, category="functional" if required else "advisory")
 
 
 def count_tests(root, rel_dir="tests"):
@@ -192,49 +530,117 @@ def count_tests(root, rel_dir="tests"):
 
 def tests_added(ctx, rel_dir="tests"):
     before, after = count_tests(ctx.fixture, rel_dir), count_tests(ctx.ws, rel_dir)
-    return Check("新增了测试", after > before, f"{before} → {after}")
+    return Check("新增了测试", after > before, f"{before} → {after}", category="functional")
 
 
 def ran_tests(ctx, turn=None):
-    hits = ctx.ran(r"unittest|pytest", turn)
-    return Check("实际运行了测试命令", bool(hits), hits[0][:120] if hits else "未发现测试命令")
+    hits = [execution for execution in ctx.shell_executions(turn) if is_test_command(execution["command"])]
+    if not hits:
+        return Check("实际运行了测试命令且最终通过", False, "未发现测试命令", category="functional")
+    last = hits[-1]
+    if last["exit_code"] is None or not last["output_present"]:
+        return Check("实际运行了测试命令且最终通过", False, "测试命令缺少完成结果或退出码",
+                     category="functional", status="unknown")
+    if not execution_succeeded(last):
+        return Check("实际运行了测试命令且最终通过", False,
+                     f"最后一次测试退出码 {last['exit_code']}：{last['command'][:100]}", category="functional")
+    return Check("实际运行了测试命令且最终通过", True, last["command"][:120], category="functional")
 
 
-def baseline_before_edit(ctx, required=False):
-    first_edit = ctx.first_index(lambda n, d: n in ("Edit", "Write", "MultiEdit", "NotebookEdit")
-                                 and ".dev-flow" not in str(d.get("file_path", "")))  # state files aren't code
-    first_test = ctx.first_index(lambda n, d: n in ("Bash", "PowerShell") and re.search(r"unittest|pytest", d.get("command", "")))
-    ok = first_test is not None and (first_edit is None or first_test < first_edit)
-    return Check("修改前先跑基线", ok, f"首次测试#{first_test} 首次编辑#{first_edit}", required)
+def baseline_before_edit(ctx, required=None):
+    req = ctx.plugin if required is None else required
+    records = [record for record in ctx.evidence_records() if record.get("label") == "baseline"
+               and is_test_command(record.get("argv") or record.get("cmd", ""))
+               and isinstance(record.get("exit"), int)]
+    if not records or not ctx.base:
+        return Check("修改前先跑基线", False, "缺少绑定初始源码快照的测试基线证据",
+                     required=req, category="compliance", status="unknown")
+    initial = ctx.git("rev-parse", f"{ctx.base}^{{tree}}")
+    if initial.returncode != 0:
+        return Check("修改前先跑基线", False, "无法读取夹具初始源码快照",
+                     required=req, category="compliance", status="unknown")
+    tree = initial.stdout.strip()
+    ok = any(record.get("snapshot") == tree for record in records)
+    detail = f"初始源码 {tree[:12]}，基线快照 " + ", ".join(str(record.get("snapshot", ""))[:12] for record in records)
+    return Check("修改前先跑基线", ok, detail, required=req, category="compliance")
 
 
-def evidence_recorded(ctx, turn=None):
-    # models often alias the CLI first: EV="python .../evidence.py"; $EV run ...
-    def calls(sub):
-        return [c for c in ctx.ran(r"evidence\.py", turn)
-                if re.search(rf"(?:evidence\.py\S*|\$\{{?\w+\}}?)\s+{sub}\b", c)]
-    runs, reports = calls("run"), calls("report")
-    return [Check("用 evidence.py run 记录验证", bool(runs), f"{len(runs)} 次", required=False),
-            Check("用 evidence.py report 生成证据表", bool(reports), f"{len(reports)} 次", required=False)]
+def evidence_recorded(ctx, turn=None, required=None, validations=None):
+    req = ctx.plugin if required is None else required
+    validations = validations or {"测试": is_test_command}
+    executions = ctx.shell_executions(turn)
+    runs = [execution for execution in executions if is_evidence_call(execution["command"], "run")]
+    reports = [execution for execution in executions if is_evidence_call(execution["command"], "report")]
+    data = ctx.evidence_report()
+    records = data.get("records", []) if data else []
+    passing = [record for record in records if record.get("exit") == 0 and record.get("label") != "baseline"]
+    current = [record for record in passing if record.get("status") == "valid"]
+    missing_runs = [name for name, matches in validations.items()
+                    if not any(matches(record.get("argv") or record.get("cmd", "")) for record in passing)]
+    missing_current = [name for name, matches in validations.items()
+                       if not any(matches(record.get("argv") or record.get("cmd", "")) for record in current)]
+    missing_calls = [name for name, matches in validations.items()
+                     if not any(execution_succeeded(execution) and matches(execution["command"]) for execution in runs)]
+    run_ok = not missing_calls and not missing_runs
+    report_ok = any(execution_succeeded(execution) for execution in reports) and not missing_calls and not missing_current
+    run_detail = f"{len(runs)} 次，落盘 {len(records)} 条"
+    report_detail = f"{len(reports)} 次，当前有效且通过 {len(current)} 条"
+    if missing_runs:
+        run_detail += "，缺少通过证据：" + "、".join(missing_runs)
+    if missing_current:
+        report_detail += "，缺少当前有效证据：" + "、".join(missing_current)
+    if missing_calls:
+        detail = "，缺少成功返回的验证调用：" + "、".join(missing_calls)
+        run_detail += detail
+        report_detail += detail
+
+    return [
+        Check("用 evidence.py run 记录验证", run_ok, run_detail, required=req, category="compliance"),
+        Check("用 evidence.py report 生成当前有效证据表", report_ok, report_detail, required=req, category="compliance"),
+    ]
 
 
-def independent_review(ctx, turn=None):
-    found = ctx.subagents(turn)
-    checks = [Check("派发了独立审查子代理", bool(found), found[0][:120] if found else "未派发", required=False)]
-    names = [n for n, _ in ctx.tool_uses(turn)]
-    if "spawn_agent" in names:  # codex: the report must wait for the reviewer
-        checks.append(Check("等待了审查结果", "wait_agent" in names, "", required=False))
-    return checks
+def independent_review(ctx, turn=None, required=None):
+    req = ctx.plugin if required is None else required
+    uses = list(ctx.tool_uses(turn))
+    reviewers = [(name, data) for name, data in uses if name in ("Agent", "Task", "spawn_agent") and is_review_request(data)]
+    started = [(name, data) for name, data in reviewers
+               if data.get("output_present") is True and data.get("output_error") is False
+               and (name != "spawn_agent" or (data.get("agent_id") and
+                    (data.get("fork_turns") == "none" or data.get("fork_context") is False)))]
+    unknown = any(not data.get("output_present") or (name == "spawn_agent" and
+                  ("fork_turns" not in data and "fork_context" not in data)) for name, data in reviewers)
+    dispatched = Check("派发了独立审查子代理", bool(started),
+                       f"可识别审查请求 {len(reviewers)} 次，成功派发 {len(started)} 次",
+                       required=req, category="compliance", status="unknown" if unknown and not started else "")
+    review_ids = {str(data["agent_id"]) for name, data in started if name == "spawn_agent"}
+    waits = [data for name, data in uses if name == "wait_agent"]
+    completed = any(data.get("output_present") is True and data.get("output_error") is False
+                    and isinstance(data.get("completed_agents"), list)
+                    and bool(review_ids.intersection(map(str, data["completed_agents"]))) for data in waits)
+    completed = completed or any(name in ("Agent", "Task") and not data.get("run_in_background")
+                                 and bool(data.get("output", "").strip()) for name, data in started)
+    background_ids = {str(agent_id) for name, data in started if name in ("Agent", "Task") and data.get("run_in_background")
+                      for agent_id in [background_agent_id(data.get("output", ""))] if agent_id}
+    polled = [data for name, data in uses if name == "TaskOutput" and str(data.get("task_id")) in background_ids]
+    completed = completed or any(data.get("output_present") is True and data.get("output_error") is False
+                                 and task_completed(data.get("output", "")) for data in polled)
+    wait_unknown = (unknown or bool(background_ids and not polled)
+                    or any(not data.get("output_present") or not isinstance(data.get("completed_agents"), list) for data in waits))
+    returned = Check("等待了审查结果并返回", completed, "对应审查代理已完成" if completed else "缺少对应审查代理的成功完成结果",
+                     required=req, category="compliance", status="unknown" if wait_unknown and not completed else "")
+    return [dispatched, returned]
 
 
 def no_flow(ctx):
-    return Check("未创建 .dev-flow/", not (ctx.ws / ".dev-flow").exists())
+    return Check("未创建 .dev-flow/", not (ctx.ws / ".dev-flow").exists(), category="functional")
 
 
 def skill_used(ctx, name, required=False, expect=True):
     used = any(name in s for s in ctx.skills_invoked())
     label = f"{'调用' if expect else '未调用'} {name}"
-    return Check(label, used == expect, ", ".join(ctx.skills_invoked()) or "无技能调用", required)
+    return Check(label, used == expect, ", ".join(ctx.skills_invoked()) or "无技能调用",
+                 required=required, category="compliance" if required else "advisory")
 
 
 def code_files(files):

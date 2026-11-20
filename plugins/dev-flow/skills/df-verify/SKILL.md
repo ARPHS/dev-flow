@@ -1,6 +1,6 @@
 ---
 name: df-verify
-description: 在声明开发任务完成之前调用：选择并运行适用的测试、静态检查、构建和真实入口验证，用配套的 evidence.py 记录可复核证据（verify, run tests, check before done）。
+description: 在声明代码功能、缺陷修复或配置变更完成之前调用：选择并运行适用的测试、静态检查、构建和真实入口验证，用配套的 evidence.py 记录可复核证据（verify, run tests, check before done）。仅改文案、拼写或只读问答等无需完整验证流程的单点小修不要自动调用。
 ---
 
 # Verify
@@ -13,9 +13,11 @@ description: 在声明开发任务完成之前调用：选择并运行适用的�
 
 | 命令 | 用途 |
 |---|---|
-| `$EV run -l <AC1/baseline/lint…> -- <程序> <参数...>` | 运行命令并原样输出，退出码与原命令一致；同时追加记录到 `.dev-flow/evidence.jsonl` |
-| `$EV report` | 列出每条命令的最新记录及其状态：`当前有效`、`之后改动：<文件>`、`无法对比` |
+| `$EV run -l <AC1/baseline/lint…> -- <程序> <参数...>` | 运行命令并输出（超长输出自动落盘 `.dev-flow/logs/` 并打印摘要，失败保留关键细节），退出码与原命令一致；同时追加记录到 `.dev-flow/evidence.jsonl` |
+| `$EV report [--json]` | 列出每条命令的最新记录及其状态：`当前有效`、`之后改动：<文件>`、`无法对比` |
 | `$EV fingerprint` | 打印当前工作区的快照 id（内容相同则 id 相同，与是否提交无关） |
+| `$EV diff <开工快照> <候选快照>` | 只读查看两个已保存快照的完整差异，包含未跟踪文件；快照缺失时报错，不自动退回 HEAD 对比 |
+| `$EV doctor [--json]` | 只读诊断 Python、Git、仓库和 `.dev-flow/` 状态（不修改任何配置） |
 
 `run` 直接执行 `--` 之后的程序，不经过 shell，参数由你当前的 shell 拆分，所以在 bash、PowerShell、cmd 下写法相同：
 
@@ -26,9 +28,9 @@ $EV run -l lint -- npm run lint
 
 需要管道、`&&`、设置环境变量等 shell 特性时，显式包一层：`-- bash -c "LEDGER_FILE=/tmp/l.json python -m ledger list"`，或 `-- pwsh -NoProfile -Command "..."`。不要把整条命令放进一对引号里传给 `run`，它会报错提示。Windows PowerShell 5.1 会丢掉传给外部程序的参数里嵌套的双引号，包装命令内部改用单引号，或改用 `pwsh`（7.x）。
 
-Codex 的 Windows 沙箱中，Python 3.12.4 及以上用 `tempfile`（`mkdtemp`、`TemporaryDirectory`）创建的目录随后无法访问，表现为测试报 `PermissionError` / `WinError 5`，路径是 `tmp*` 目录。**第一次出现就判定为环境阻碍，停止排查**：改 `TEMP`/`TMP`、预建目录、写包装脚本重跑都无效，也不要改写项目测试。能申请提权就提权重跑；不能时把受影响的测试列入"未运行的检查"，验收条件改用真实入口（CLI、API 调用）验证。沙箱里删不掉的残留目录在最终报告中列出，请用户手动删除。git 报 `detected dubious ownership`（`elevated` 沙箱用户不是仓库所有者）同样是环境阻碍：给该命令设置环境变量 `GIT_CONFIG_COUNT=1`、`GIT_CONFIG_KEY_0=safe.directory`、`GIT_CONFIG_VALUE_0=*`，不要修改项目或全局的 git 配置，也不必阅读 `evidence.py` 源码排查。
+遇到 Windows 沙箱 `tempfile` 权限错误（`PermissionError` / `WinError 5`）、Git `dubious ownership` 或 WSL `python3` 用法问题时，按 [sandbox.md](references/sandbox.md) 处理，不要反复绕行或改写项目测试。
 
-快照对象只写入 `.dev-flow/objects`，不写进项目的 `.git`，也不改动暂存区。只有存在 `.dev-flow/` 时才会记录：`feature`、`project` 任务必须已有该目录（由 `df-flow` 创建，缺失时先创建，并写入内容为 `*` 的 `.dev-flow/.gitignore`）；`quick` 或单独验证且没有该目录时，直接运行命令即可。
+快照对象只写入 `.dev-flow/objects`，不写进项目的 `.git`，也不改动暂存区。只有存在 `.dev-flow/` 时才会记录：`feature`、`project` 任务必须已有该目录（由 `df-flow` 创建，缺失时先创建，并写入内容为 `*` 的 `.dev-flow/.gitignore`）；`quick` 或单独验证且没有该目录时，直接运行命令即可。TDD 红阶段的探索性失败测试直接运行命令即可，不必用 `$EV run` 写入台账；基线、切片验收与最终检查再通过 `$EV run` 记录，保持证据表清晰。
 
 ## 步骤
 

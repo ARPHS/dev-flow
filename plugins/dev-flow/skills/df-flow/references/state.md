@@ -12,7 +12,8 @@
 ├── progress.md     # 当前状态、断点、基线和下一步
 ├── decisions.md    # 只有存在产品或架构取舍时创建
 ├── evidence.jsonl  # 验证记录，只由 df-verify 的 evidence.py 写入
-└── objects/        # evidence.py 的快照对象，可随时删除
+├── objects/        # evidence.py 的快照对象，删除后旧快照可能无法对比
+└── logs/           # 验证命令的完整长日志
 ```
 
 ## 不进入版本库
@@ -20,6 +21,8 @@
 创建 `.dev-flow/` 时同时写入 `.dev-flow/.gitignore`，内容只有一行 `*`：整个目录（包括这个文件本身）不会出现在 `git status` 中，也不修改项目自己的 `.gitignore` 或 `.git/`（Codex 默认沙箱禁止写 `.git/`）。用户希望共享台账时，把这个文件改为只忽略 `objects/`、`evidence.jsonl` 和 `index-*`。
 
 ## 模板
+
+台账只保留极简索引，不重复抄录完整对话或命令长日志（验证输出统一由 `evidence.jsonl` 和 `.dev-flow/logs/` 管理）。
 
 ### project.md
 
@@ -51,17 +54,19 @@
 
 ### progress.md
 
-验证结果不写在这里，统一由 `evidence.py` 记录到 `evidence.jsonl`。
+验证结果不写在这里，统一由 `evidence.py` 记录到 `evidence.jsonl`。状态细分为实现、验证、审查三个活跃阶段，避免把“已写完代码”误记为完成。
 
 ```markdown
-状态：in-progress | blocked | done
+状态：implementing | verifying | reviewing | blocked | done
 
 ## 当前
 - 切片：
 - 分支/工作区：
 - 未提交文件：<git status --short 摘要>
 ## 基线
-- <命令> → 退出码 <n>，<已有失败项或"全部通过">（全量 / 局部：<范围> / 复用 <日期> 的全量验证）
+- 开工前已有改动：<文件列表或"无">
+- 开工快照：<修改任务文件前的 evidence.py fingerprint；不可用时说明原因>
+- <命令> → 退出码 <n>，<已有失败项或"全部通过" / "空项目，当前无测试设施">（全量 / 局部：<范围> / 复用 <日期> 的全量验证）
 ## 阻碍
 ## 下一步
 ```
@@ -81,6 +86,8 @@
 - 被阻塞、向用户提问、上下文接近上限、结束会话前。
 - 标记 `状态：done` 前必须先运行 `df-verify`，确认 `evidence.py report` 中作为证据的记录都是"当前有效"，或已写明保留理由。
 
+派发审查时提供开工快照和候选版本快照（来自最终 `report`）。审查者用 `evidence.py diff <开工快照> <候选快照>` 查看本次改动；文件清单只作为索引，不用它排除整个已有脏改动文件。审查结束前保留快照对象；对象已清理时如实说明无法对比。
+
 ## 恢复
 
 先读 `.dev-flow/`，再检查文件、分支、提交、未跟踪文件，并重新运行最近一次的验证命令。记录与现场冲突时以现场为准并修正记录。`evidence.py report` 中状态不是"当前有效"的记录，按 df-verify 的规则重跑或说明理由。不要为了让状态看起来完整而丢弃未提交改动。
@@ -92,5 +99,6 @@
 1. 保留 `project.md`，按需要更新命令和约定。
 2. 旧任务未完成时先询问用户是否放弃；已完成时用新任务覆盖 `task.md` 和 `progress.md`，`decisions.md` 中仍有效的决定保留。
 3. 删除 `evidence.jsonl` 和 `objects/`。它们只服务于单个任务；跨任务复用的基线已记在 `project.md` 的"最近全量验证"中，且快照 id 的比较不依赖这些对象。
+4. 修改任务文件前取得并记录本任务的开工快照。
 
 任务完成后保留 `.dev-flow/` 供后续恢复。`objects/` 超过 200MB 时 `evidence.py` 会自动清空，你也可以随时删除它，代价只是更早的记录显示为"无法对比"。
