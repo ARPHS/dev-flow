@@ -882,23 +882,46 @@ class EvalCasesTest(unittest.TestCase):
             "set -e; false && python -m unittest discover -s tests; true",
             "set -e; python -m unittest discover -s tests && true; true",
             "set -e\nif false; then\npython -m unittest discover -s tests\nfi\ntrue",
+            "set -e\nfunction verify {\n  python -m unittest discover -s tests\n}\ntrue",
+            "set -e\nverify() {\n  python -m unittest discover -s tests\n}\ntrue",
+            "set -e\nverify(){\n  python -m unittest discover -s tests\n}\ntrue",
+            "set -e\nif true; then\n  set +e\nfi\npython -m unittest discover -s tests\ntrue",
+            "set -e\neval \"set +e\"\npython -m unittest discover -s tests\ntrue",
+            "set -e\nOFF=\"set +e\"\n$OFF\npython -m unittest discover -s tests\ntrue",
+            "set -e\n`echo set +e`\npython -m unittest discover -s tests\ntrue",
+            "set -e; source ./helper.sh; python -m unittest discover -s tests; true",
             "set -e; exit 0; python -m unittest discover -s tests",
         ):
             with self.subTest(unguaranteed=unguaranteed):
                 self.assertFalse(lib.is_test_command(unguaranteed))
                 self.assertFalse(lib.invokes_python_module(unguaranteed, "ledger", "list", "--json"))
 
-        # ran_tests marks conditional/masked test runs as unknown (never pass), even after an earlier passing run
+        # ran_tests marks conditional/masked/uninvoked-function/dynamic-errexit test runs as unknown (never pass)
         for masked_cmd in (
             "set -e; false && python -m unittest discover -s tests; true",
             "set -e; python -m unittest discover -s tests && true; true",
             "python -m unittest discover -s tests; true",
+            "set -e\nfunction verify {\n  python -m unittest discover -s tests\n}\ntrue",
+            "set -e\nverify() {\n  python -m unittest discover -s tests\n}\ntrue",
+            "set -e\nif true; then\n  set +e\nfi\npython -m unittest discover -s tests\ntrue",
+            "set -e\neval \"set +e\"\npython -m unittest discover -s tests\ntrue",
         ):
             with self.subTest(masked_cmd=masked_cmd):
                 t = fake_transcript(("Bash", {"command": masked_cmd}))
                 chk = lib.ran_tests(Context(ws=Path(self.tmp.name), fixture=FIXTURES / "ledger", base="", transcripts=[t]))
                 self.assertFalse(chk.ok)
                 self.assertEqual(chk.status, "unknown")
+
+        # End-to-end --no-plugin feature case must fail when tests are only inside an uninvoked function
+        ws, base = self.workspace("ledger")
+        self._apply_feature_solution(ws)
+        fn_transcript = fake_transcript(
+            ("Bash", {"command": "set -e\nfunction verify {\n  python -m unittest discover -s tests\n}\ntrue"}),
+            ("Edit", {"file_path": "ledger/cli.py"}),
+            ("Bash", {"command": "python -m ledger list --json"}),
+        )
+        fn_checks = load_grader("feature")(self.context("ledger", ws, base, fn_transcript, plugin=False))
+        self.assertIn("实际运行了测试命令且最终通过", required_failures(fn_checks))
 
         masked_after_pass = fake_transcript(
             ("Bash", {"command": "python -m unittest discover -s tests"}),

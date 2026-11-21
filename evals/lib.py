@@ -76,9 +76,10 @@ def python_args(argv):
     return args
 
 
-CONTROL_OPEN = {"if", "while", "until", "for", "case", "{"}
-CONTROL_CLOSE = {"fi", "done", "esac", "}"}
-CONTROL_MID = {"then", "elif", "else", "do", "in", "!"}
+CONTROL_OPEN = {"if", "while", "until", "for", "case"}
+CONTROL_CLOSE = {"fi", "done", "esac"}
+CONTROL_MID = {"then", "elif", "else", "do", "in", "!", "function", "select", "coproc", "time"}
+DYNAMIC_BUILTINS = {"eval", "source", ".", "trap", "exec", "alias", "unalias", "builtin", "command", "shopt", "unset"}
 EXIT_WORDS = {"exit", "return"}
 
 
@@ -87,26 +88,30 @@ def _tokenize_shell(text):
     tokens = []
     buf = []
     has_token = False
+    was_quoted = False
+
+    def flush():
+        nonlocal buf, has_token, was_quoted
+        if has_token:
+            word = "".join(buf)
+            is_brace = not was_quoted and word in ("{", "}")
+            tokens.append((word, is_brace))
+            buf, has_token, was_quoted = [], False, False
+
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
         if ch in " \t\r":
-            if has_token:
-                tokens.append(("".join(buf), False))
-                buf, has_token = [], False
+            flush()
             i += 1
         elif ch == "\n":
-            if has_token:
-                tokens.append(("".join(buf), False))
-                buf, has_token = [], False
+            flush()
             tokens.append(("\n", True))
             i += 1
         elif ch == "\\" and i + 1 < n and text[i + 1] == "\n":
             i += 2
-        elif ch in ";&|<>()":
-            if has_token:
-                tokens.append(("".join(buf), False))
-                buf, has_token = [], False
+        elif ch in ";&|<>()`":
+            flush()
             if text[i:i + 3] == "<<-":
                 tokens.append(("<<-", True))
                 i += 3
@@ -118,6 +123,7 @@ def _tokenize_shell(text):
                 i += 1
         elif ch == "'":
             has_token = True
+            was_quoted = True
             i += 1
             while i < n and text[i] != "'":
                 buf.append(text[i])
@@ -127,6 +133,7 @@ def _tokenize_shell(text):
             i += 1
         elif ch == '"':
             has_token = True
+            was_quoted = True
             i += 1
             while i < n and text[i] != '"':
                 if text[i] == "\\" and i + 1 < n and text[i + 1] in ('"', "\\"):
@@ -142,8 +149,7 @@ def _tokenize_shell(text):
             has_token = True
             buf.append(ch)
             i += 1
-    if has_token:
-        tokens.append(("".join(buf), False))
+    flush()
     return tokens
 
 
@@ -293,22 +299,26 @@ def _parse_shell_command(command, aliases=None, errexit=False, allow_errexit=Tru
         statements.append(cur_stmt)
 
     guaranteed_groups, candidate_groups = [], []
-    block_depth, paren_depth = 0, 0
+    block_depth, brace_depth, paren_depth = 0, 0, 0
     terminated = False
 
     for stmt_idx, stmt in enumerate(statements):
         is_last = stmt_idx == len(statements) - 1
         parts, ops, current = [], [], []
         has_trailing_bg = False
-        has_paren = False
+        has_grouping = False
 
         for tok, is_op in stmt:
-            if is_op and tok in ("(", ")"):
-                has_paren = True
+            if is_op and tok in ("(", ")", "{", "}", "`"):
+                has_grouping = True
                 if tok == "(":
                     paren_depth += 1
-                else:
+                elif tok == ")":
                     paren_depth = max(0, paren_depth - 1)
+                elif tok == "{":
+                    brace_depth += 1
+                elif tok == "}":
+                    brace_depth = max(0, brace_depth - 1)
                 if current:
                     parts.append(current)
                     current = []
@@ -342,21 +352,40 @@ def _parse_shell_command(command, aliases=None, errexit=False, allow_errexit=Tru
             elif head in CONTROL_MID:
                 entered_control = True
 
-        in_control = entered_control or block_depth > 0 or paren_depth > 0 or has_paren
+        in_control = entered_control or block_depth > 0 or brace_depth > 0 or paren_depth > 0 or has_grouping
+        if in_control:
+            # Any control block, function definition, or grouping invalidates straight-line `set -e` inference.
+            errexit = False
+            allow_errexit = False
 
-        # Case 1: single simple command (no &&, ||, |, trailing &, control block)
+        # Case 1: single simple command (no &&, ||, |, trailing &, control block, grouping)
         if len(parts) == 1 and not ops and not has_trailing_bg and not in_control:
             argv = parts[0]
             if _record_assignments(argv, active_aliases, out_aliases=None if terminated else out_aliases):
                 continue
-            if allow_errexit and not terminated:
-                toggled = _is_set_errexit(argv)
+            stripped = _strip_env_prefix(argv)
+            resolved = stripped
+            if stripped:
+                alias_match = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?", stripped[0])
+                if alias_match and alias_match.group(1) in active_aliases:
+                    alias_name = alias_match.group(1)
+                    nested = {k: v for k, v in active_aliases.items() if k != alias_name}
+                    prefixes, _, _, _ = _parse_shell_command(active_aliases[alias_name], aliases=nested,
+                                                             allow_errexit=False)
+                    if len(prefixes) == 1:
+                        resolved = [*prefixes[0], *stripped[1:]]
+            head = resolved[0] if resolved else ""
+            if head in DYNAMIC_BUILTINS or head.startswith("$"):
+                # Dynamic builtins or unresolved variable commands may alter errexit or control flow arbitrarily.
+                errexit = False
+                allow_errexit = False
+            elif allow_errexit and not terminated:
+                toggled = _is_set_errexit(resolved)
                 if toggled is not None:
                     errexit = toggled
             snap_aliases = dict(active_aliases)
             candidate_groups.append((argv, snap_aliases))
-            stripped = _strip_env_prefix(argv)
-            if stripped and stripped[0] in EXIT_WORDS:
+            if head in EXIT_WORDS:
                 terminated = True
                 continue
             if not terminated and (is_last or (allow_errexit and errexit)):
@@ -365,6 +394,10 @@ def _parse_shell_command(command, aliases=None, errexit=False, allow_errexit=Tru
 
         # Case 2: pure `&&` chain (only guaranteed when it is the FINAL statement)
         if parts and ops and all(op == "&&" for op in ops) and not has_trailing_bg and not in_control:
+            if not is_last:
+                # Non-final compound chains break the straight-line `set -e` assumption.
+                errexit = False
+                allow_errexit = False
             chain_aliases = dict(active_aliases)
             chain_still_runs = not terminated
             seen_command = False
@@ -387,7 +420,9 @@ def _parse_shell_command(command, aliases=None, errexit=False, allow_errexit=Tru
                     guaranteed_groups.append((part, snap_aliases))
             continue
 
-        # Case 3: `||`, `|`, trailing `&`, control blocks, subshells -> never guaranteed
+        # Case 3: `||`, `|`, trailing `&`, control blocks, functions, subshells -> never guaranteed
+        errexit = False
+        allow_errexit = False
         for part in parts:
             if not part:
                 continue
